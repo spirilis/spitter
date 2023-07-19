@@ -5,6 +5,7 @@ package alerts
 
 import (
 	"errors"
+	"fmt"
 	"log"
 	"net/url"
 	"os"
@@ -23,6 +24,7 @@ import (
 type RoutingConfig struct {
 	AlertmanagerBaseURL string
 	PrometheusBaseURL   string
+	ApplicationName     string // used for naming prometheus metrics - if blank, metrics will not be added
 
 	urlrepAlertmanager *URLReplacements
 	urlrepPrometheus   *URLReplacements
@@ -32,12 +34,13 @@ type RoutingConfig struct {
 var GlobalRoutingConfig *RoutingConfig
 
 // Initialization function that should be run after the GlobalRoutingConfig URL strings are set
-func ParseRoutingConfigs(alertmanagerURL string, prometheusURL string) error {
+func ParseRoutingConfigs(alertmanagerURL string, prometheusURL string, appname string) error {
 	if GlobalRoutingConfig == nil {
 		GlobalRoutingConfig = new(RoutingConfig)
 	}
 	GlobalRoutingConfig.AlertmanagerBaseURL = alertmanagerURL
 	GlobalRoutingConfig.PrometheusBaseURL = prometheusURL
+	GlobalRoutingConfig.ApplicationName = appname
 
 	GlobalRoutingConfig.urlrepAlertmanager = &URLReplacements{
 		NewURLPrefix: GlobalRoutingConfig.AlertmanagerBaseURL,
@@ -181,6 +184,67 @@ func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, 
 	}
 
 	return tmpval, nil
+}
+
+func (a *AlertmanagerWebhookInputV4) String() string {
+	if a == nil {
+		return "nil"
+	}
+	var out string
+
+	labelPrinter := func(g map[string]string) string {
+		var o string
+		for k, v := range g {
+			o += "  " + k + ": " + v + "\n"
+		}
+		return o
+	}
+
+	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sExternalURL: %s\nAlerts: %d count\n",
+		a.Version,
+		a.GroupKey,
+		a.TruncatedAlertCount,
+		a.Status,
+		a.Receiver,
+		labelPrinter(a.GroupLabels),
+		labelPrinter(a.CommonLabels),
+		labelPrinter(a.CommonAnnotations),
+		a.ExternalURL,
+		len(a.Alerts),
+	)
+
+	return out
+}
+
+func (a *AlertmanagerWebhookTemplateV4) String() string {
+	if a == nil {
+		return "nil"
+	}
+	var out string
+
+	labelPrinter := func(g map[string]string) string {
+		var o string
+		for k, v := range g {
+			o += "  " + k + ": " + v + "\n"
+		}
+		return o
+	}
+
+	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sExternalURL: %s\nOriginal URL: %s\nAlerts: %d count\n",
+		a.Version,
+		a.GroupKey,
+		a.TruncatedAlertCount,
+		a.Status,
+		a.Receiver,
+		labelPrinter(a.GroupLabels),
+		labelPrinter(a.CommonLabels),
+		labelPrinter(a.CommonAnnotations),
+		a.ExternalURL,
+		a.OriginalExternalURL,
+		len(a.Alerts),
+	)
+
+	return out
 }
 
 type URLReplacements struct {

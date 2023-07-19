@@ -142,11 +142,13 @@ func TestResolvingAlert1Template(t *testing.T) {
 	}
 
 	log.Printf("Alertmanager webhook: %#v\n", n)
+	log.Printf("Alertmanager webhook string form:\n%s\n", n.String())
 
 	// Configure GlobalRouting for the alerts system
 	err = ParseRoutingConfigs(
 		"https://rancher2.my-company.com/k8s/clusters/c-asdfg/api/v1/namespaces/monitoring-system/services/http:rancher-monitoring-alertmanager:9093/proxy",
 		"https://rancher2.my-company.com/k8s/clusters/c-asdfg/api/v1/namespaces/monitoring-system/services/http:rancher-monitoring-prometheus:9090/proxy",
+		"",
 	)
 	if err != nil {
 		t.Errorf("Error configuring GlobalRoutingConfig - %v", err)
