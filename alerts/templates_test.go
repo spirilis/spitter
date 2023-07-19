@@ -11,7 +11,7 @@ import (
 	"text/template"
 
 	sprig "github.com/Masterminds/sprig/v3"
-	"gopkg.in/yaml.v2"
+	"gopkg.in/yaml.v3"
 )
 
 var testTemp = `
