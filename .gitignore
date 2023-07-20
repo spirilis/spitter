@@ -21,3 +21,6 @@ main
 # Go workspace file
 go.work
 go.work.sum
+
+# Seen this on NFS homedirectories
+.nfs*

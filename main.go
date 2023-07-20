@@ -18,16 +18,18 @@ const DEBUGLEVEL_TRACE = true
 const DEBUGLEVEL_DEBUG = true
 const DEBUGLEVEL_INFO = true
 const DEBUGLEVEL_WARNING = true
-const DEBUGLEVEL_CRITICAL = true
 
 var CLI struct {
 	Router struct {
-		Config string `optional:"" name:"config" help:"Path to config file defining the WebhookServer parameters"`
-	} `cmd:"" help:"Execute a webhook router server receiving Alertmanager V4 webhooks"`
+		Config       string `optional:"" name:"config" help:"Path to config file defining the WebhookServer parameters"`
+		Alertmanager string `optional:"" name:"alertmanager" help:"Accessible URL to the root of the Alertmanager webserver"`
+		Prometheus   string `optional:"" name:"prometheus" help:"Accessible URL to the root of the Prometheus webserver"`
+		RouterDir    string `optional:"" name:"routers" help:"Directory full of webhook router YAML or JSON configuration documents"`
+	} `cmd:"" help:"Run a webhook router server receiving Alertmanager V4 webhooks"`
 	Dump struct {
 		Listen string `optional:"" name:"listen" help:"Hostname or IP address of interface to listen"`
 		Port   int    `optional:"" name:"port" help:"TCP port for listening"`
-	} `cmd:"" help:"Execute a simple webserver that dumps its requests to stdout"`
+	} `cmd:"" help:"Run a simple webserver that dumps its requests to stdout"`
 }
 
 func main() {
@@ -52,6 +54,7 @@ func main() {
 			r.Matchers = append(r.Matchers, m)
 			configObj.Routers = append(configObj.Routers, r)
 		} else {
+			// Read the config file
 			cf, err := os.ReadFile(CLI.Router.Config)
 			if err != nil {
 				log.Fatalf("Error reading Router config file: %v\n", err)
@@ -63,7 +66,18 @@ func main() {
 				log.Fatalf("Error unmarshalling Router config from file [%s]: %v\n", CLI.Router.Config, err)
 			}
 		}
+		// CLI config option overrides
+		if CLI.Router.Alertmanager != "" {
+			configObj.AlertmanagerURL = CLI.Router.Alertmanager
+		}
+		if CLI.Router.Prometheus != "" {
+			configObj.PrometheusURL = CLI.Router.Prometheus
+		}
+		if CLI.Router.RouterDir != "" {
+			configObj.AdditionalRouterDirectory = CLI.Router.RouterDir
+		}
 
+		// Run the webhook routing server
 		err := configObj.Start()
 		if err != nil {
 			log.Fatalf("WebhookServer returned with error: %v\n", err)

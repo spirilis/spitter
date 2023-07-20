@@ -18,7 +18,6 @@ const DEBUGLEVEL_TRACE = true
 const DEBUGLEVEL_DEBUG = true
 const DEBUGLEVEL_INFO = true
 const DEBUGLEVEL_WARNING = true
-const DEBUGLEVEL_CRITICAL = true
 
 type ServerDump struct {
 	Listen          string `yaml:"host,omitempty"`
@@ -34,9 +33,15 @@ var healthzCounter prometheus.Counter
 
 func (s *ServerDump) Start() error {
 	if s.Listen == "" {
+		if DEBUGLEVEL_TRACE {
+			log.Println("No Listen string provided; using default of 0.0.0.0")
+		}
 		s.Listen = "0.0.0.0"
 	}
 	if s.Port < 1 {
+		if DEBUGLEVEL_TRACE {
+			log.Println("No Port provided; using default of 9880")
+		}
 		s.Port = 9880
 	}
 
@@ -46,12 +51,18 @@ func (s *ServerDump) Start() error {
 		Help: "Total number of HTTP requests seen",
 	})
 	prometheus.MustRegister(connectionCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_serverdump_webhook_requests", s.ApplicationName)
+	}
 
 	healthzCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: s.ApplicationName + "_serverdump_healthz_count",
 		Help: "Total number of /healthz health check requests",
 	})
 	prometheus.MustRegister(healthzCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_serverdump_healthz_count", s.ApplicationName)
+	}
 
 	// Set up HTTP handlers
 	var allURIs []string
@@ -67,7 +78,9 @@ func (s *ServerDump) Start() error {
 
 	listenStr := fmt.Sprintf("%s:%d", s.Listen, s.Port)
 	log.Printf("ServerDump listening on: %s\n", listenStr)
-	log.Printf("All URIs: %#v\n", allURIs)
+	if DEBUGLEVEL_DEBUG {
+		log.Printf("All URIs: %#v\n", allURIs)
+	}
 	log.Fatal(http.ListenAndServe(listenStr, nil))
 	return nil
 }

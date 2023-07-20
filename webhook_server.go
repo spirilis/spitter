@@ -4,14 +4,17 @@ package main
 import (
 	"bytes"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"regexp"
 	"sync"
+	"syscall"
 	"text/template"
 
 	"github.com/Masterminds/sprig"
@@ -22,6 +25,7 @@ import (
 	"gopkg.in/yaml.v2"
 )
 
+// WebhookRouter handles a single destination endpoint - a set of matchers decides which alerts get routed to this destination.
 type WebhookRouter struct {
 	DestURL        string                 `yaml:"url"`
 	HttpMethod     string                 `yaml:"method"`
@@ -53,13 +57,20 @@ func (r *WebhookRouter) Check() error {
 type WebhookAuthentication struct {
 	BearerToken         string            `yaml:"token,omitempty"`
 	BearerTokenFromFile string            `yaml:"tokenFile,omitempty"`
+	BasicAuth           WebhookBasicAuth  `yaml:"basicAuth,omitempty"`
 	Cookies             map[string]string `yaml:"cookies,omitempty"`
 }
 
+type WebhookBasicAuth struct {
+	Username string `yaml:"username"`
+	Password string `yaml:"password"`
+}
+
+func (a WebhookBasicAuth) AuthorizationHeader() string {
+	return "Basic " + string(base64.StdEncoding.EncodeToString([]byte(a.Username+":"+a.Password)))
+}
+
 func (wa *WebhookAuthentication) ResolveBearerToken() error {
-	if wa == nil {
-		return nil
-	}
 	if wa.BearerTokenFromFile != "" {
 		contents, err := os.ReadFile(wa.BearerTokenFromFile)
 		if err != nil {
@@ -73,6 +84,17 @@ func (wa *WebhookAuthentication) ResolveBearerToken() error {
 	return nil
 }
 
+func (wa *WebhookAuthentication) AuthorizationHeader() string {
+	if wa.BearerToken != "" {
+		return "Bearer " + wa.BearerToken
+	}
+	if wa.BasicAuth.Username != "" && wa.BasicAuth.Password != "" {
+		return "Basic " + wa.BasicAuth.AuthorizationHeader()
+	}
+	return ""
+}
+
+// WebhookRouter's Matcher system defined here-
 type WebhookMatcher struct {
 	Label          string `yaml:"label"`
 	MatchString    string `yaml:"match,omitempty"`
@@ -162,14 +184,6 @@ func sliceContains(sl []string, val string) bool {
 	return false
 }
 
-// func mapKeyStrings(m map[string]string) []string {
-// 	out := make([]string, len(m))
-// 	for k := range m {
-// 		out = append(out, k)
-// 	}
-// 	return out
-// }
-
 func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommonLabels []string) bool {
 	if r == nil {
 		log.Println("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
@@ -212,6 +226,7 @@ func (m *WebhookRouter) IsMatch(label string, value string) bool {
 	return false
 }
 
+// This accepts an input Alertmanager webhook and prepares it for consumption by the router's template-
 func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4) (*alerts.AlertmanagerWebhookTemplateV4, error) {
 	if r == nil {
 		return nil, errors.New("WebhookRouter.PrepareTemplateData error: Called with a null WebhookRouter object")
@@ -254,6 +269,7 @@ func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4
 	return tmpAlert, nil
 }
 
+// Operational function to execute the router's template and submit the webhook to its destination
 func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) error {
 	b := &bytes.Buffer{}
 	b.Grow(len(r.Template)) // Not exact but hopefully accurate enough to reduce the # of memory reallocations
@@ -280,7 +296,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		// Configure request parameters - content-type, cookies and/or bearer token
 		req.Header.Set("Content-Type", r.ContentType)
 		if r.Authentication.BearerToken != "" {
-			req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", r.Authentication.BearerToken))
+			req.Header.Set("Authorization", r.Authentication.AuthorizationHeader())
 		}
 		if r.Authentication.Cookies != nil && len(r.Authentication.Cookies) > 0 {
 			for k, v := range r.Authentication.Cookies {
@@ -353,11 +369,117 @@ type WebhookServerListen struct {
 }
 
 type WebhookServerMetrics struct {
-	URI         string `yaml:"path,omitempty"`
-	Token       string `yaml:"token,omitempty"`
-	TokenEnvVar string `yaml:"tokenEnv,omitempty"`
+	URI   string `yaml:"path,omitempty"`
+	Token string `yaml:"token,omitempty"`
 }
 
+// Loading and interpretation of the routers has been offloaded to a separate function to facilitate the re-loading of config during runtime, using SIGHUP.
+// This facilitates things such as Kubernetes operator control, dynamically updating configs.
+var routersRejected int
+var routerMutex sync.Mutex
+var rejectedRouters prometheus.Gauge
+
+func (w *WebhookServer) ReloadRouters() error {
+	// Read the specified set of routers, check for consistency, apply default HTTP method if relevant, and add to the array
+	var tmpAllRouters []*WebhookRouter
+	tmpRoutersRejected := 0
+	for _, rt := range w.Routers {
+		if rt.Check() != nil {
+			tmpRoutersRejected++
+			continue
+		}
+		if rt.HttpMethod == "" {
+			rt.HttpMethod = "POST"
+		}
+		if rt.ContentType == "" {
+			rt.ContentType = "application/yaml"
+		}
+		if rt.Authentication.ResolveBearerToken() != nil {
+			tmpRoutersRejected++
+			continue
+		}
+		tmpAllRouters = append(tmpAllRouters, rt)
+		if DEBUGLEVEL_DEBUG {
+			log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
+		}
+	}
+	if w.AdditionalRouterDirectory != "" {
+		if DEBUGLEVEL_DEBUG {
+			log.Printf("Inspecting AdditionalRouterDirectory [%s] for more routers", w.AdditionalRouterDirectory)
+		}
+		// Read every file in this directory and attempt to unmarshal it into a WebhookRouter object; if it fails, ignore and just keep going
+		files, err := os.ReadDir(w.AdditionalRouterDirectory)
+		if err == nil {
+			for _, file := range files {
+				if !file.IsDir() {
+					filename := file.Name()
+					contents, err := os.ReadFile(w.AdditionalRouterDirectory + "/" + filename)
+					if err == nil {
+						b := bytes.NewBuffer(contents)
+						dec := yaml.NewDecoder(b)
+						rt := new(WebhookRouter)
+						err = dec.Decode(rt)
+						if err == nil {
+							// Lint the object to make sure it has the minimum fields
+							if rt.Check() == nil {
+								// Check doesn't verify HTTP Method since we assume POST as a default here.
+								if rt.HttpMethod == "" {
+									rt.HttpMethod = "POST"
+								}
+								if rt.ContentType == "" {
+									rt.ContentType = "application/yaml"
+								}
+								if rt.Authentication.ResolveBearerToken() != nil {
+									tmpRoutersRejected++
+								} else {
+									tmpAllRouters = append(tmpAllRouters, rt)
+									if DEBUGLEVEL_DEBUG {
+										log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
+									}
+
+								}
+							} else {
+								tmpRoutersRejected++
+								if DEBUGLEVEL_DEBUG {
+									log.Printf("Read WebhookRouter object but it failed its Check(): [%s]", file.Name())
+								}
+							}
+						} else {
+							if DEBUGLEVEL_DEBUG {
+								log.Printf("Read file but could not unmarshal as WebhookRouter object: [%s]", file.Name())
+							}
+						}
+					} else {
+						if DEBUGLEVEL_TRACE {
+							log.Printf("Error reading file [%s]: %v", file.Name(), err)
+						}
+					}
+				} else {
+					if DEBUGLEVEL_TRACE {
+						log.Printf("Directory entry is a directory: %s", file.Name())
+					}
+				}
+			}
+		} else {
+			if DEBUGLEVEL_DEBUG {
+				log.Printf("WebhookServer.Start had an error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
+			}
+		}
+	}
+
+	if len(tmpAllRouters) < 1 {
+		return errors.New("WebhookServer.ReloadRouters error - No valid routers present")
+	}
+
+	routerMutex.Lock()
+	routersRejected = tmpRoutersRejected
+	w.allRouters = tmpAllRouters
+	routerMutex.Unlock()
+
+	return nil
+}
+
+// Main entrypoint for the WebhookServer.
 func (w *WebhookServer) Start() error {
 	if w == nil {
 		return errors.New("WebhookServer.Start error - nil WebhookServer object")
@@ -380,66 +502,10 @@ func (w *WebhookServer) Start() error {
 		return fmt.Errorf("WebhookServer.Start had an error initializing the alerts routing configs: %v", err)
 	}
 
-	// Read the specified set of routers, check for consistency, apply default HTTP method if relevant, and add to the array
-	routersRejected := 0
-	for _, rt := range w.Routers {
-		if rt.Check() != nil {
-			routersRejected++
-			continue
-		}
-		if rt.HttpMethod == "" {
-			rt.HttpMethod = "POST"
-		}
-		if rt.ContentType == "" {
-			rt.ContentType = "application/yaml"
-		}
-		if rt.Authentication.ResolveBearerToken() != nil {
-			routersRejected++
-			continue
-		}
-		w.allRouters = append(w.allRouters, rt)
-	}
-	if w.AdditionalRouterDirectory != "" {
-		// Read every file in this directory and attempt to unmarshal it into a WebhookRouter object; if it fails, ignore and just keep going
-		files, err := os.ReadDir(w.AdditionalRouterDirectory)
-		if err != nil {
-			return fmt.Errorf("WebhookServer.Start had an error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
-		}
-		for _, file := range files {
-			if !file.IsDir() {
-				filename := file.Name()
-				contents, err := os.ReadFile(w.AdditionalRouterDirectory + "/" + filename)
-				if err == nil {
-					b := bytes.NewBuffer(contents)
-					dec := yaml.NewDecoder(b)
-					n := new(WebhookRouter)
-					err = dec.Decode(n)
-					if err == nil {
-						// Lint the object to make sure it has the minimum fields
-						if n.Check() == nil {
-							// Check doesn't verify HTTP Method since we assume POST as a default here.
-							if n.HttpMethod == "" {
-								n.HttpMethod = "POST"
-							}
-							if n.ContentType == "" {
-								n.ContentType = "application/yaml"
-							}
-							if n.Authentication.ResolveBearerToken() != nil {
-								routersRejected++
-							} else {
-								w.allRouters = append(w.allRouters, n)
-							}
-						} else {
-							routersRejected++
-						}
-					}
-				}
-			}
-		}
-	}
-
-	if len(w.allRouters) < 1 {
-		return errors.New("WebhookServer.Start error - No valid routers present")
+	// Load initial set of routers
+	err = w.ReloadRouters()
+	if err != nil {
+		return fmt.Errorf("WebhookServer.Start had an error initializating routers: %v", err)
 	}
 
 	// Set some initial prometheus metrics relevant to startup
@@ -448,12 +514,18 @@ func (w *WebhookServer) Start() error {
 		Help: "This is the number of webhook router configs defined in the running spitter instance",
 	})
 	c.Set(float64(len(w.allRouters)))
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_routers", ApplicationName)
+	}
 
-	c = promauto.NewGauge(prometheus.GaugeOpts{
+	rejectedRouters = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: ApplicationName + "_webhook_routers_rejected",
 		Help: "This is the number of webhook router configs viewed - either in app config or found as valid routers in the additional router config directory - and determined unworkable",
 	})
-	c.Set(float64(routersRejected))
+	rejectedRouters.Set(float64(routersRejected))
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_routers_rejected", ApplicationName)
+	}
 
 	// connectionMutex, connectionGauge defined further below near the main API handler function
 	connectionGauge = promauto.NewGauge(prometheus.GaugeOpts{
@@ -461,18 +533,27 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of active connections to the webhook router (active connections from an Alertmanager)",
 	})
 	connectionGauge.Set(0)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_connections", ApplicationName)
+	}
 
 	connectionCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests",
 		Help: "Total number of webhook requests seen",
 	})
 	prometheus.MustRegister(connectionCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_requests", ApplicationName)
+	}
 
 	healthzCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_healthz_count",
 		Help: "Total number of /healthz health check requests",
 	})
 	prometheus.MustRegister(healthzCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_healthz_count", ApplicationName)
+	}
 
 	// webhookreq* mutex and prometheus metric variables defined further below near main API handler function
 	webhookreqAttemptedCounter = prometheus.NewCounter(prometheus.CounterOpts{
@@ -480,12 +561,39 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and attempted",
 	})
 	prometheus.MustRegister(webhookreqAttemptedCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_requests_attempted", ApplicationName)
+	}
 
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests_successful",
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed",
 	})
 	prometheus.MustRegister(webhookreqSuccessfulCounter)
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Registered Prometheus metric: %s_webhook_requests_successful", ApplicationName)
+	}
+
+	// Set up SIGHUP handler for reloading routers
+	hupChan := make(chan os.Signal, 4)
+	go func(hupchan chan os.Signal, w *WebhookServer) {
+		for {
+			<-hupchan
+			if DEBUGLEVEL_TRACE {
+				log.Println("SIGHUP received")
+			}
+			err := w.ReloadRouters()
+			if err != nil {
+				// True to the same behavior as .Start(), if there are no routers defined, we bomb.
+				// K8s would show this as a continual restart followed by a CrashLoopBackoff, most likely.  Hopefully that'll get someone's attention.
+				panic("SIGHUP router reload ended in error: " + err.Error())
+			}
+			routerMutex.Lock()
+			rejectedRouters.Set(float64(routersRejected))
+			routerMutex.Unlock()
+		}
+	}(hupChan, w)
+	signal.Notify(hupChan, syscall.SIGHUP)
 
 	// Set up Prometheus metrics config
 	if w.Metrics == nil {
@@ -525,6 +633,7 @@ func (w *WebhookServer) GetRouters() []*WebhookRouter {
 	return w.allRouters
 }
 
+// HealthZ for readiness probes
 var healthzMutex sync.Mutex
 var healthzCounter prometheus.Counter
 
@@ -540,6 +649,9 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("Up\n"))
 }
 
+// Handle incoming Alertmanager Webhooks, find which routers match and use their .SendWebhook function to send it out.
+// This is done sequentially.
+// TODO: Should we parallelize it with goroutines?
 var connectionMutex sync.Mutex
 var connectionGauge prometheus.Gauge
 var connectionCountMutex sync.Mutex
@@ -614,6 +726,9 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Find routers that might want to receive this
+	if DEBUGLEVEL_TRACE {
+		log.Printf("Processing through %d routers-", len(GlobalWebhookServer.GetRouters()))
+	}
 	for _, r := range GlobalWebhookServer.GetRouters() {
 		hasMatching := 0
 		for _, m := range r.Matchers {
