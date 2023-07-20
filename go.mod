@@ -4,7 +4,9 @@ require github.com/spirilis/spitter/alerts v0.0.0
 
 require (
 	github.com/Masterminds/sprig v2.22.0+incompatible
+	github.com/alecthomas/kong v0.8.0
 	github.com/prometheus/client_golang v1.16.0
+	github.com/spirilis/spitter/dump v0.0.0
 	gopkg.in/yaml.v2 v2.4.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -33,5 +35,7 @@ require (
 )
 
 replace github.com/spirilis/spitter/alerts v0.0.0 => ./alerts
+
+replace github.com/spirilis/spitter/dump v0.0.0 => ./dump
 
 go 1.20

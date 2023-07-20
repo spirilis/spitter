@@ -1,0 +1,59 @@
+listen:
+  host: "0.0.0.0"
+  port: 9820
+alertmanagerURL: http://alertmanager
+prometheusURL: http://prometheus
+routers:
+- url: http://my-test-server:9880/dump
+  method: POST
+  contentType: text/plain
+  template: |-
+    Status: {{ .Status }}
+    Alertmanager: {{ .ExternalURL }}
+    Orig: {{ .OriginalExternalURL }}
+    Alerts:
+    {{ range .Alerts -}}
+      {{ .Status }}:
+        labels-
+        {{ range $k, $v := .Labels -}}
+        {{ $k }}: {{ $v }}
+        {{ end -}}
+        annotations-
+        {{ range $k, $v := .Annotations -}}
+        {{ $k }}: {{ $v }}
+        {{ end -}}
+        Generator: {{ .GeneratorURL }}
+        Orig: {{ .OriginalGeneratorURL }}
+        ---
+    {{- end }}
+  matchers:
+  - label: severity
+    match_re: ".*"
+- url: http://my-test-server:9890/dump
+  method: POST
+  contentType: application/json
+  template: |-
+    {
+      "Status": "{{.Status}}",
+      "Alertmanager": "{{.ExternalURL}}",
+      "Alerts": [
+      {{ $ac := 0 }}{{ range .Alerts }}{{ if $ac }},{{"\n"}}{{ end }}{{ $ac = add1 $ac -}}
+        {
+          "Status": "{{.Status}}",
+          "Labels": {
+            {{ $al := 0 }}{{range $k, $v := .Labels}}{{ if $al }},{{ end }}{{ $al = add1 $al -}}
+            "{{$k}}": "{{$v}}"
+            {{end}}
+          },
+          "Annotations": {
+            {{ $aa := 0 }}{{range $k, $v := .Annotations}}{{ if $aa }},{{ end }}{{ $aa = add1 $aa -}}
+            "{{$k}}": "{{$v}}"
+            {{end}}
+          },
+          "Prometheus": "{{ .GeneratorURL }}"
+        }{{ end }}
+      ]
+    }
+  matchers:
+  - label: severity
+    match_re: ".*"

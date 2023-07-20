@@ -9,6 +9,7 @@ Proposed metrics this application should collect:
   * spitter_webhook_requests_attempted - how many Alertmanager webhooks have we processed & attempted to route
   * spitter_webhook_requests_successful - how many Alertmanager webhooks have we processed, attempted to route and were successful
   * spitter_webhook_connections - how many webhook server requests are in flight (connection count)
+  * spitter_healthz_count - how many /healthz requests have come through
 * AlertmanagerWebhookTemplateV4
   * get a map of labels that have been matched by existing routers and create a new instance of a prometheus counter with label="<thatlabel>", increment the counter every time we route one for it
   * total number of individual alerts received

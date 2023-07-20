@@ -27,8 +27,8 @@ var testTemp = `
 func TestBasicTemplate(t *testing.T) {
 	tp := template.Must(template.New("test").Funcs(sprig.FuncMap()).Parse(testTemp))
 	var data struct {
-		Items    []string `json:"items"`
-		Response string   `json:"response"`
+		Items    []string `yaml:"items"`
+		Response string   `yaml:"response"`
 	}
 	data.Items = []string{"str1", "str2", "str3", "str4"}
 	if err := tp.Execute(os.Stdout, data); err != nil {
