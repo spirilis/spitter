@@ -3,7 +3,7 @@ listen:
   port: 9820
 alertmanagerURL: http://alertmanager
 prometheusURL: http://prometheus
-addlRouterDir: /home/myuser/webhooks
+addlRouterDir: /rhome/ebrundic/tmp2
 routers:
 - url: http://my-test-server:9880/dump
   method: POST

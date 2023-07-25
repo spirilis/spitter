@@ -24,3 +24,6 @@ go.work.sum
 
 # Seen this on NFS homedirectories
 .nfs*
+
+# Local webhook server YAML has details not appropriate for public view
+examples/webhook_server_local.yml
