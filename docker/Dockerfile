@@ -17,6 +17,8 @@ COPY --from=build /spitter /usr/local/bin/.
 EXPOSE 9820
 
 COPY docker/entrypoint.sh /entrypoint.sh
-RUN chmod 755 /entrypoint.sh
+COPY docker/config-reload.sh /usr/local/bin/.
+
+RUN chmod 755 /entrypoint.sh /usr/local/bin/config-reload.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

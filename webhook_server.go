@@ -596,32 +596,40 @@ func (w *WebhookServer) Start() error {
 		}
 	}(hupChan, w)
 	signal.Notify(hupChan, syscall.SIGHUP)
+	if DEBUGLEVEL_DEBUG {
+		log.Println("Listening for SIGHUP to reload the router list")
+	}
 
 	// Set up ReloadTriggerFile watcher for reloading routers
-	go func(watchFile string, w *WebhookServer) {
-		for {
-			f, err := os.Open(watchFile)
-			if err == nil {
-				// File exists!  Close it, reload routers, delete the file
-				f.Close()
-				err = w.ReloadRouters()
-				if err != nil {
-					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
-					// K8s would show this as a continual restart followed by a CrashLoopBackoff, most likely.  Hopefully that'll get someone's attention.
-					panic("Reload trigger-initiated router reload ended in error: " + err.Error())
+	if w.ReloadTriggerFile != "" {
+		go func(watchFile string, w *WebhookServer) {
+			for {
+				f, err := os.Open(watchFile)
+				if err == nil {
+					// File exists!  Close it, reload routers, delete the file
+					f.Close()
+					err = w.ReloadRouters()
+					if err != nil {
+						// True to the same behavior as .Start(), if there are no routers defined, we bomb.
+						// K8s would show this as a continual restart followed by a CrashLoopBackoff, most likely.  Hopefully that'll get someone's attention.
+						panic("Reload trigger-initiated router reload ended in error: " + err.Error())
+					}
+					routerMutex.Lock()
+					rejectedRouters.Set(float64(routersRejected))
+					routerMutex.Unlock()
+					err = os.Remove(watchFile)
+					if err != nil {
+						panicMsg := fmt.Sprintf("Issuing os.Remove(%s) on reload-trigger file ended in error: %v", watchFile, err)
+						panic(panicMsg)
+					}
 				}
-				routerMutex.Lock()
-				rejectedRouters.Set(float64(routersRejected))
-				routerMutex.Unlock()
-				err = os.Remove(watchFile)
-				if err != nil {
-					panicMsg := fmt.Sprintf("Issuing os.Remove(%s) on reload-trigger file ended in error: %v", watchFile, err)
-					panic(panicMsg)
-				}
+				time.Sleep(5 * time.Second)
 			}
-			time.Sleep(5 * time.Second)
+		}(w.ReloadTriggerFile, w)
+		if DEBUGLEVEL_DEBUG {
+			log.Printf("Watching every 5 seconds for trigger file [%s] to reload the router list", w.ReloadTriggerFile)
 		}
-	}(w.ReloadTriggerFile, w)
+	}
 
 	// Set up Prometheus metrics config
 	if w.Metrics == nil {
