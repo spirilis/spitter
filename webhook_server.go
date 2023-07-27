@@ -485,7 +485,7 @@ func (w *WebhookServer) Start() error {
 		return errors.New("WebhookServer.Start error - nil WebhookServer object")
 	}
 	if w.Listen == nil {
-		w.Listen = &WebhookServerListen{Hostname: "127.0.0.1", Port: 9820}
+		w.Listen = &WebhookServerListen{Hostname: "0.0.0.0", Port: 9820}
 	}
 	if w.AlertmanagerURL == "" {
 		return errors.New("WebhookServer.Start error - We expect a valid URL to the alertmanager instance")
@@ -623,6 +623,8 @@ func (w *WebhookServer) Start() error {
 	listenStr := fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
 	if DEBUGLEVEL_INFO {
 		log.Printf("WebhookServer listening on: %s\n", listenStr)
+	}
+	if DEBUGLEVEL_DEBUG {
 		log.Printf("All URIs: %#v\n", allURIs)
 	}
 	log.Fatal(http.ListenAndServe(listenStr, nil))
