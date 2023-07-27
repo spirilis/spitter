@@ -23,6 +23,9 @@ EOF
         if [ -n "$ROUTERS_DIR" ]; then
             ARGS="$ARGS --routers=${ROUTERS_DIR}"
         fi
+        if [ -n "$RELOAD_TRIGGER_FILE" ]; then
+            ARGS="$ARGS --reload-trigger=${RELOAD_TRIGGER_FILE}"
+        fi
 
         /usr/local/bin/spitter router $ARGS
         ;;

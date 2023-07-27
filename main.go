@@ -21,10 +21,11 @@ const DEBUGLEVEL_WARNING = true
 
 var CLI struct {
 	Router struct {
-		Config       string `optional:"" name:"config" help:"Path to config file defining the WebhookServer parameters"`
-		Alertmanager string `optional:"" name:"alertmanager" help:"Accessible URL to the root of the Alertmanager webserver"`
-		Prometheus   string `optional:"" name:"prometheus" help:"Accessible URL to the root of the Prometheus webserver"`
-		RouterDir    string `optional:"" name:"routers" help:"Directory full of webhook router YAML or JSON configuration documents"`
+		Config        string `optional:"" name:"config" help:"Path to config file defining the WebhookServer parameters"`
+		Alertmanager  string `optional:"" name:"alertmanager" help:"Accessible URL to the root of the Alertmanager webserver"`
+		Prometheus    string `optional:"" name:"prometheus" help:"Accessible URL to the root of the Prometheus webserver"`
+		RouterDir     string `optional:"" name:"routers" help:"Directory full of webhook router YAML or JSON configuration documents"`
+		ReloadTrigger string `optional:"" name:"reload-trigger" help:"File to watch indicating a reload of router config is necessary; file is deleted after reload.  SIGHUP also performs this."`
 	} `cmd:"" help:"Run a webhook router server receiving Alertmanager V4 webhooks"`
 	Dump struct {
 		Listen string `optional:"" name:"listen" help:"Hostname or IP address of interface to listen"`
@@ -75,6 +76,9 @@ func main() {
 		}
 		if CLI.Router.RouterDir != "" {
 			configObj.AdditionalRouterDirectory = CLI.Router.RouterDir
+		}
+		if CLI.Router.ReloadTrigger != "" {
+			configObj.ReloadTriggerFile = CLI.Router.ReloadTrigger
 		}
 
 		// Run the webhook routing server

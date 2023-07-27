@@ -16,6 +16,7 @@ import (
 	"sync"
 	"syscall"
 	"text/template"
+	"time"
 
 	"github.com/Masterminds/sprig"
 	"github.com/prometheus/client_golang/prometheus"
@@ -357,6 +358,7 @@ type WebhookServer struct {
 	PrometheusURL             string                `yaml:"prometheusURL"`
 	Routers                   []*WebhookRouter      `yaml:"routers,omitempty"`
 	AdditionalRouterDirectory string                `yaml:"addlRouterDir,omitempty"`
+	ReloadTriggerFile         string                `yaml:"reloadTriggerFile,omitempty"`
 	Metrics                   *WebhookServerMetrics `yaml:"metrics,omitempty"`
 	allRouters                []*WebhookRouter
 }
@@ -594,6 +596,32 @@ func (w *WebhookServer) Start() error {
 		}
 	}(hupChan, w)
 	signal.Notify(hupChan, syscall.SIGHUP)
+
+	// Set up ReloadTriggerFile watcher for reloading routers
+	go func(watchFile string, w *WebhookServer) {
+		for {
+			f, err := os.Open(watchFile)
+			if err == nil {
+				// File exists!  Close it, reload routers, delete the file
+				f.Close()
+				err = w.ReloadRouters()
+				if err != nil {
+					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
+					// K8s would show this as a continual restart followed by a CrashLoopBackoff, most likely.  Hopefully that'll get someone's attention.
+					panic("Reload trigger-initiated router reload ended in error: " + err.Error())
+				}
+				routerMutex.Lock()
+				rejectedRouters.Set(float64(routersRejected))
+				routerMutex.Unlock()
+				err = os.Remove(watchFile)
+				if err != nil {
+					panicMsg := fmt.Sprintf("Issuing os.Remove(%s) on reload-trigger file ended in error: %v", watchFile, err)
+					panic(panicMsg)
+				}
+			}
+			time.Sleep(5 * time.Second)
+		}
+	}(w.ReloadTriggerFile, w)
 
 	// Set up Prometheus metrics config
 	if w.Metrics == nil {
