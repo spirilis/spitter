@@ -1,4 +1,4 @@
-FROM golang:1.20 AS build
+FROM golang:1.20-alpine AS build
 
 WORKDIR /app
 
@@ -12,10 +12,11 @@ FROM alpine:3.16 AS runtime
 
 RUN apk update && apk add curl bash less
 
-COPY --from=build /spitter /usr/local/bin/
+COPY --from=build /spitter /usr/local/bin/.
 
 EXPOSE 9820
 
 COPY docker/entrypoint.sh /entrypoint.sh
+RUN chmod 755 /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

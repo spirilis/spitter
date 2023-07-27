@@ -35,6 +35,9 @@ EOF
 
         /usr/local/bin/spitter dump $ARGS
         ;;
+    --help)
+        /usr/local/bin/spitter --help
+        ;;
     *)
         shift
         $0 router "$@"
