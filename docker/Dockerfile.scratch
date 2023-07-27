@@ -1,0 +1,17 @@
+FROM golang:1.20-alpine AS build
+
+WORKDIR /app
+
+COPY . .
+
+RUN go mod download
+
+RUN go build -o /spitter
+
+FROM scratch AS runtime
+
+COPY --from=build /spitter /.
+
+EXPOSE 9820
+
+ENTRYPOINT ["/spitter"]
