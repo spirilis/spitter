@@ -3,7 +3,7 @@ listen:
   port: 9820
 alertmanagerURL: http://alertmanager
 prometheusURL: http://prometheus
-addlRouterDir: /rhome/ebrundic/tmp2
+addlRouterDir: /
 routers:
 - url: http://my-test-server:9880/dump
   method: POST
