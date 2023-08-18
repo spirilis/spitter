@@ -1,0 +1,138 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "spitter.fullname" . }}
+  labels:
+    {{- include "spitter.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "spitter.selectorLabels" . | nindent 6 }}
+      {{- if .Values.prometheus.enabled }}
+      spitter-prometheus: {{ include "spitter.fullname" . }}
+      {{- end }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "spitter.selectorLabels" . | nindent 8 }}
+        {{- if .Values.prometheus.enabled }}
+        spitter-prometheus: {{ include "spitter.fullname" . }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "spitter.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          {{- with .Values }}
+            {{- if .image.registry }}
+          image: "{{ .image.registry }}/{{ .image.repository }}:{{ .image.tag | toString | default $.Chart.AppVersion }}"
+            {{- else }}
+          image: "{{ .image.repository }}:{{ .image.tag | toString | default $.Chart.AppVersion }}"
+            {{- end }}
+          {{- end }}
+          {{- if .Values.image.args }}
+          args:
+            {{- toYaml .Values.image.args | nindent 12 }}
+          {{- else }}
+          args:
+            - router
+            {{- if and .Values.spitter.router.config.configMap .Values.spitter.router.config.key }}
+            - --config
+            - /var/run/spitter/{{ .Values.spitter.router.config.key }}
+            {{- end }}
+            - --routers
+            - {{ .Values.spitter.router.mountPath }}
+            - --reload-trigger
+            - {{ .Values.spitter.reloadSignal.path }}/{{ .Values.spitter.reloadSignal.file }}
+            {{- if .Values.spitter.alertmanagerURL }}
+            - --alertmanager
+            - {{ .Values.spitter.alertmanagerURL }}
+            {{- end }}
+            {{- if .Values.spitter.prometheusURL }}
+            - --prometheus
+            - {{ .Values.spitter.prometheusURL }}
+            {{- end }}
+          {{- end }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.spitter.port | int }}
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+          - name: config
+            mountPath: /var/run/spitter/{{ .Values.spitter.router.config.key }}
+            subPath: {{ .Values.spitter.router.config.key }}
+          - name: routers
+            mountPath: {{ .Values.spitter.router.mountPath }}
+          - name: reload-trigger
+            mountPath: {{ .Values.spitter.reloadSignal.path }}
+        - name: {{ .Chart.Name }}-cfgreload
+          {{- with .Values }}
+            {{- if .image.registry }}
+          image: "{{ .image.registry }}/{{ .image.repository }}:{{ .image.tag | toString | default $.Chart.AppVersion }}"
+            {{- else }}
+          image: "{{ .image.repository }}:{{ .image.tag | toString | default $.Chart.AppVersion }}"
+            {{- end }}
+          {{- end }}
+          {{- with .Values.spitter }}
+          command: ["/bin/sh"]
+          args:
+            - -c
+            - /usr/local/bin/config-reload.sh {{ .router.mountPath }} {{ .reloadSignal.path }}/{{ .reloadSignal.file }}
+          volumeMounts:
+          - name: reload-trigger
+            mountPath: {{ .reloadSignal.path }}
+          - name: routers
+            mountPath: {{ .router.mountPath }}
+          {{- end }}
+      {{- if .Values.extraContainers }}
+        {{ toYaml .Values.extraContainers | nindent 8 }}
+      {{- end }}
+      {{- if .Values.initContainers }}
+      initContainers:
+        {{ toYaml .Values.initContainers | nindent 8 }}
+      {{- end }}
+      volumes:
+      - name: config
+        configMap:
+          name: {{ .Values.spitter.router.config.configMap }}
+      - name: routers
+        configMap:
+          name: {{ .Values.spitter.router.routers }}
+      - name: reload-trigger
+        emptyDir: {}
+      {{- if .Values.extraVolumes }}
+        {{- toYaml .Values.extraVolumes | nindent 6 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

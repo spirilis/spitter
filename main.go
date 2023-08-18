@@ -18,6 +18,7 @@ const DEBUGLEVEL_TRACE = true
 const DEBUGLEVEL_DEBUG = true
 const DEBUGLEVEL_INFO = true
 const DEBUGLEVEL_WARNING = true
+const ENABLE_HEALTHZ_DEBUG = false
 
 var CLI struct {
 	Router struct {

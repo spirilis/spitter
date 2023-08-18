@@ -1,0 +1,24 @@
+{{- if .Values.prometheus.enabled }}
+{{- if .Values.prometheus.endpoints }}
+apiVersion: monitoring.coreos.com/v1
+kind: PodMonitor
+metadata:
+  name: {{ include "spitter.fullname" . }}-prometheus-scrape
+  {{- with .Values.prometheus.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  jobLabel: spitter-prometheus
+  selector:
+    matchExpressions:
+    - key: spitter-prometheus
+      operator: In
+      values:
+      - "{{ include "spitter.fullname" . }}"
+  namespaceSelector:
+    matchNames:
+    - "{{ .Release.Namespace }}"
+  podMetricsEndpoints:
+    {{- toYaml .Values.prometheus.endpoints | nindent 4 }}
+{{- end }}{{- end }}

@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"golang.org/x/exp/maps"
 )
 
 // Supports Alertmanager webhook versions: 4
@@ -159,6 +161,8 @@ func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, 
 	tmpval.OriginalExternalURL = a.ExternalURL
 	// Transmute prometheus URL in each alert's GeneratorURL
 	for _, l := range a.Alerts {
+		maps.Copy(l.Labels, a.CommonLabels)
+		maps.Copy(l.Annotations, a.CommonAnnotations)
 		newAlert := &AlertmanagerAlertV4{
 			Status:      l.Status,
 			Labels:      l.Labels,

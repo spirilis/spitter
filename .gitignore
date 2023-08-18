@@ -28,3 +28,4 @@ go.work.sum
 # Local configuration not to be committed upstream
 examples/webhook_server_local.yml
 docker/Dockerfile.local
+tmp/*

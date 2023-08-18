@@ -680,7 +680,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	healthzCounter.Inc()
 	healthzMutex.Unlock()
 
-	if DEBUGLEVEL_TRACE {
+	if DEBUGLEVEL_TRACE && ENABLE_HEALTHZ_DEBUG {
 		log.Printf("Received healthz request [%#v]", r)
 	}
 	w.WriteHeader(http.StatusOK)
