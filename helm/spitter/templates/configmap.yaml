@@ -1,0 +1,29 @@
+{{- if .Values.spitter.router.config.autogenerate }}
+apiVersion: v1
+kind: ConfigMap
+  {{- with .Values.spitter }}
+metadata:
+  name: {{ .router.config.configMap }}
+data:
+  {{ .router.config.key }}: |-
+    listen:
+      host: 0.0.0.0
+      port: {{ .port | int }}
+    {{- with .alertmanagerURL }}
+    alertmanagerURL: {{ . }}
+    {{- end }}
+    {{- with .prometheusURL }}
+    prometheusURL: {{ . }}
+    {{- end }}
+    {{- if and .router.additionalRouters.configMap .router.additionalRouters.mountPath }}
+    addlRouterDir: {{ .router.additionalRouters.mountPath }}
+    {{- end }}
+    reloadTriggerFile: {{ .reloadSignal.path }}/{{ .reloadSignal.file }}
+    metrics:
+      path: /metrics
+    {{- if .router.routers }}
+    routers:
+      {{ toYaml .router.routers | nindent 6 }}
+    {{- end }}
+  {{- end }}
+{{- end }}

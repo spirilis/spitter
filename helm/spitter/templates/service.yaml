@@ -4,9 +4,9 @@ metadata:
   name: {{ include "spitter.fullname" . }}
   labels:
     {{- include "spitter.labels" . | nindent 4 }}
-  {{- if .Values.service.annotations }}
   annotations:
-    {{ toYaml .Values.service.annotations | nindent 4 }}
+  {{- with .Values.service.annotations }}
+    {{ toYaml . | nindent 4 }}
   {{- end }}
 spec:
   {{- with .Values.service }}
@@ -14,6 +14,9 @@ spec:
   type: NodePort
     {{- else }}
       {{- if .type }}
+        {{- if eq .type "NodePort" }}
+          {{- fail "For type=NodePort, please set .service.nodePort.enabled to true instead of specifying type: NodePort" }}
+        {{- end }}
   type: {{ .type }}
       {{- else }}
   type: ClusterIP
@@ -29,15 +32,21 @@ spec:
       {{- else }}
       targetPort: {{ $.Values.spitter.port | int }}
       {{- end }}
+      {{- if and .nodePort.enabled (gt (.nodePort.number | int) 0) }}
+      nodePort: {{ .nodePort.number | int }}
+      {{- end }}
       protocol: TCP
       name: http
       appProtocol: http
     {{- if .additionalPorts }}{{- $aidx := 0 }}{{- range .additionalPorts }}{{- $aidx = add1 $aidx }}
-    - port: {{ .port }}
+    - port: {{ .port | int }}
       {{- if gt (.targetPort | int) 0 }}
       targetPort: {{ .targetPort | int }}
       {{- else }}
-      targetPort: {{ .port }}
+      targetPort: {{ .port | int }}
+      {{- end }}
+      {{- if and $.Values.service.nodePort.enabled (gt (.nodePort | int) 0) }}
+      nodePort: {{ .nodePort | int }}
       {{- end }}
       {{- if .protocol }}
       protocol: {{ .protocol | quote }}
@@ -56,3 +65,6 @@ spec:
   {{- end }}
   selector:
     {{- include "spitter.selectorLabels" . | nindent 4 }}
+  {{- with .Values.service.customServiceSpec }}
+    {{ toYaml . | nindent 2 }}
+  {{- end }}

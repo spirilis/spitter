@@ -53,18 +53,21 @@ spec:
             {{- if and .Values.spitter.router.config.configMap .Values.spitter.router.config.key }}
             - --config
             - /var/run/spitter/{{ .Values.spitter.router.config.key }}
-            {{- end }}
+            {{- else }}
+            {{- if and .Values.spitter.router.additionalRouters.configMap .Values.spitter.router.additionalRouters.mountPath }}
             - --routers
-            - {{ .Values.spitter.router.mountPath }}
+            - {{ .Values.spitter.router.additionalRouters.mountPath }}
+            {{- end }}
             - --reload-trigger
             - {{ .Values.spitter.reloadSignal.path }}/{{ .Values.spitter.reloadSignal.file }}
-            {{- if .Values.spitter.alertmanagerURL }}
+              {{- if .Values.spitter.alertmanagerURL }}
             - --alertmanager
             - {{ .Values.spitter.alertmanagerURL }}
-            {{- end }}
-            {{- if .Values.spitter.prometheusURL }}
+              {{- end }}
+              {{- if .Values.spitter.prometheusURL }}
             - --prometheus
             - {{ .Values.spitter.prometheusURL }}
+              {{- end }}
             {{- end }}
           {{- end }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
@@ -82,10 +85,13 @@ spec:
           - name: config
             mountPath: /var/run/spitter/{{ .Values.spitter.router.config.key }}
             subPath: {{ .Values.spitter.router.config.key }}
+            {{- if and .Values.spitter.router.additionalRouters.configMap .Values.spitter.router.additionalRouters.mountPath }}
           - name: routers
-            mountPath: {{ .Values.spitter.router.mountPath }}
+            mountPath: {{ .Values.spitter.router.additionalRouters.mountPath }}
+            {{- end }}
           - name: reload-trigger
             mountPath: {{ .Values.spitter.reloadSignal.path }}
+        {{- if and .Values.spitter.router.additionalRouters.configMap .Values.spitter.router.additionalRouters.mountPath }}
         - name: {{ .Chart.Name }}-cfgreload
           {{- with .Values }}
             {{- if .image.registry }}
@@ -98,13 +104,14 @@ spec:
           command: ["/bin/sh"]
           args:
             - -c
-            - /usr/local/bin/config-reload.sh {{ .router.mountPath }} {{ .reloadSignal.path }}/{{ .reloadSignal.file }}
+            - /usr/local/bin/config-reload.sh {{ .router.additionalRouters.mountPath }} {{ .reloadSignal.path }}/{{ .reloadSignal.file }}
           volumeMounts:
           - name: reload-trigger
             mountPath: {{ .reloadSignal.path }}
           - name: routers
-            mountPath: {{ .router.mountPath }}
+            mountPath: {{ .router.additionalRouters.mountPath }}
           {{- end }}
+        {{- end }}
       {{- if .Values.extraContainers }}
         {{ toYaml .Values.extraContainers | nindent 8 }}
       {{- end }}
@@ -113,12 +120,16 @@ spec:
         {{ toYaml .Values.initContainers | nindent 8 }}
       {{- end }}
       volumes:
+      {{- if and .Values.spitter.router.config .Values.spitter.router.config.configMap }}
       - name: config
         configMap:
           name: {{ .Values.spitter.router.config.configMap }}
+      {{- end }}
+      {{- if and .Values.spitter.router.additionalRouters.configMap .Values.spitter.router.additionalRouters.mountPath }}
       - name: routers
         configMap:
-          name: {{ .Values.spitter.router.routers }}
+          name: {{ .Values.spitter.router.additionalRouters.configMap }}
+      {{- end }}
       - name: reload-trigger
         emptyDir: {}
       {{- if .Values.extraVolumes }}

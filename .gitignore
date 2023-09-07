@@ -26,6 +26,6 @@ go.work.sum
 .nfs*
 
 # Local configuration not to be committed upstream
-examples/webhook_server_local.yml
+examples/*_local.yml
 docker/Dockerfile.local
 tmp/*

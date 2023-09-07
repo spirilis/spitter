@@ -13,16 +13,19 @@ image:
   args: {}  # optional - if not set, the args run the entrypoint with "router" and CLI arguments reflecting values in the .spitter section below.
 
 
-# Spitter requires that you pre-load the spitter-config and spitter-routers configmaps ahead of time.
+# Spitter can auto-generate its configuration file configmap, but supplying additionalRouters means you must supply that configmap ahead of time
 spitter:
   port: 9820  # This is assumed; it is the default port if no port is given in the config.yml in your spitter-config configmap.
               # If this listener port differs in your own config file, override this when installing the helm chart.
   router:
     config:
-      configMap: spitter-config
+      autogenerate: true
+      configMap: spitter-helm-config
       key: config.yml
-    routers: spitter-routers  # this is the name of a configmap, all its keys are assumed to be router configs
-    mountPath: /spitter
+    routers: {} # optional - static set of router configs - only relevant if .spitter.router.config.autogenerate is true
+    additionalRouters:
+      configMap: {}  # this is the name of a configmap, all its keys are assumed to be router configs
+      mountPath: /spitter
   reloadSignal:
     path: /var/run/spitter-reload
     file: reload.txt
@@ -68,10 +71,10 @@ securityContext: {}
 service:
   type: ClusterIP
   port: 80
-  # targetPort: 80  # optional - if empty, .image.port is used instead
+  # targetPort: 80  # optional - if empty, .spitter.port is used instead
   nodePort:
     enabled: false
-    number: 31000
+    number: 0  # optionally specify nodePort - 30000-32767
     externalTrafficPolicy: Cluster
   annotations: {}
   additionalPorts: {}
@@ -82,6 +85,8 @@ service:
   #   nodePort: 0  # optional - can set static node port# if .service.nodePort.enabled is true
   #   protocol: TCP # optional - defaults to TCP
   #   appProtocol: "" # optional - define the protocol spec for this port
+  customServiceSpec: {} # optional - any other directives you want to put into the Service .spec, such as loadBalancerSourceRanges, ipFamilies, etc.
+                        # Do not override type:, ports:, selector: or externalTrafficPolicy: here
 
 ingress:
   enabled: false

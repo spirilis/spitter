@@ -1,5 +1,4 @@
-{{- if .Values.prometheus.enabled }}
-{{- if .Values.prometheus.endpoints }}
+{{- if .Values.prometheus.enabled }}{{- if .Values.prometheus.endpoints }}
 apiVersion: monitoring.coreos.com/v1
 kind: PodMonitor
 metadata:
