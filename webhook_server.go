@@ -277,6 +277,9 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 	tp := template.Must(template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template))
 	if err := tp.Execute(b, a); err == nil {
+        if DEBUGLEVEL_TRACE {
+            log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
+        }
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 		}

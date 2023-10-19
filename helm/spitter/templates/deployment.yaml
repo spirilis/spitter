@@ -91,6 +91,26 @@ spec:
             {{- end }}
           - name: reload-trigger
             mountPath: {{ .Values.spitter.reloadSignal.path }}
+          {{- if and .Values.envFrom (or .Values.envFrom.configMap .Values.envFrom.secret) }}
+          envFrom:
+            {{- if .Values.envFrom.configMap }}
+            {{- end }}
+            {{- if .Values.envFrom.secret }}
+            {{- end }}
+          {{- end }}
+          env:
+          {{- with .Values.env }}
+            {{- range $k, $v := . }}
+              {{- if eq (kindOf $v) "string" }}
+            - name: "{{ $k }}"
+              value: "{{ $v }}"
+              {{- else if eq (kindOf $v "map") }}
+            - name: "{{ $k }}"
+              valueFrom:
+                {{ toYaml $v | nindent 16 }}
+              {{- end }}
+            {{- end }}
+          {{- end }}
         {{- if and .Values.spitter.router.additionalRouters.configMap .Values.spitter.router.additionalRouters.mountPath }}
         - name: {{ .Chart.Name }}-cfgreload
           {{- with .Values }}

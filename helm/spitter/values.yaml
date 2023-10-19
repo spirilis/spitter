@@ -12,6 +12,15 @@ image:
   tag: ""
   args: {}  # optional - if not set, the args run the entrypoint with "router" and CLI arguments reflecting values in the .spitter section below.
 
+env:
+  # key: value
+  # key:
+  #   valueFrom:
+  #     <valueFrom clause>
+
+envFrom:
+  configMap: ""
+  secret: ""
 
 # Spitter can auto-generate its configuration file configmap, but supplying additionalRouters means you must supply that configmap ahead of time
 spitter:
