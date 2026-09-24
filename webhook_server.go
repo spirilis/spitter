@@ -58,6 +58,16 @@ func (r *WebhookRouter) Check() error {
 	if len(r.Matchers) < 1 {
 		return errors.New("no label matchers")
 	}
+	for _, m := range r.Matchers {
+		if m == nil {
+			return errors.New("nil label matcher")
+		}
+		// Compile match_re now so a bad expression rejects the router at load time instead of failing on every alert
+		if err := m.compile(); err != nil {
+			log.Printf("Rejecting router for URL [%s]: label matcher [%s] has an invalid match_re: %v", r.DestURL, m, err)
+			return fmt.Errorf("label matcher [%s] has an invalid match_re: %v", m, err)
+		}
+	}
 	if r.Authentication == nil {
 		r.Authentication = &WebhookAuthentication{}
 	}
@@ -226,31 +236,43 @@ func (m *WebhookMatcher) IsMatch(label string, value string) bool {
 	return false
 }
 
+// compile parses MatchRegexp once; WebhookRouter.Check calls it so routers are fully compiled before they handle alerts
+func (m *WebhookMatcher) compile() error {
+	if m.MatchRegexp == "" || m.compiledRegexp != nil {
+		return nil
+	}
+	rcomp, err := regexp.Compile(m.MatchRegexp)
+	if err != nil {
+		return err
+	}
+	m.compiledRegexp = rcomp
+	return nil
+}
+
 func (m *WebhookMatcher) doesRegexpMatch(re string) bool {
-	if m == nil {
+	if m == nil || m.MatchRegexp == "" {
 		return false
 	}
-	if m.compiledRegexp == nil {
-		rcomp, err := regexp.Compile(m.MatchRegexp)
-		if err != nil {
-			log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
-		}
-		m.compiledRegexp = rcomp
+	// Normally a no-op since Check() already compiled it; covers matchers that never went through Check()
+	if err := m.compile(); err != nil {
+		log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
+		return false
 	}
 
 	return m.compiledRegexp.MatchString(re)
 }
 
-func sliceContains(sl []string, val string) bool {
+func matcherListContains(sl []*WebhookMatcher, m *WebhookMatcher) bool {
 	for _, s := range sl {
-		if s == val {
+		if s == m {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommonLabels []string) bool {
+// IsMatchingAlert reports whether every one of the router's matchers is satisfied, either by the CommonLabels (matchedCommon) or by the alert's own labels
+func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommon []*WebhookMatcher) bool {
 	if r == nil {
 		log.Println("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
 		return false
@@ -262,34 +284,21 @@ func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCo
 
 	matchCount := 0
 	for _, matcher := range r.Matchers {
-		if sliceContains(matchedCommonLabels, matcher.Label) {
+		if matcherListContains(matchedCommon, matcher) {
 			// Already satisfied this one with the CommonLabels so we count it towards the total # of matched labels
 			matchCount++
 			continue
 		}
 		for k, v := range l.Labels {
 			if matcher.IsMatch(k, v) {
+				// Count each matcher at most once
 				matchCount++
+				break
 			}
 		}
 	}
 
-	return matchCount != len(r.Matchers)
-}
-
-// Another way to check if an alert is good for this; check each commonLabels and alert Labels to see if this ends up true for the # of matchers we have
-func (m *WebhookRouter) IsMatch(label string, value string) bool {
-	if m == nil {
-		log.Println("WebhookRouter.IsMatch error - called with a nil WebhookRouter")
-		return false
-	}
-
-	for _, matcher := range m.Matchers {
-		if matcher.IsMatch(label, value) {
-			return true
-		}
-	}
-	return false
+	return matchCount == len(r.Matchers)
 }
 
 // This accepts an input Alertmanager webhook and prepares it for consumption by the router's template-
@@ -310,10 +319,14 @@ func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4
 		return nil, fmt.Errorf("WebhookRouter.PrepareTemplateData: Error when converting the alertmanager webhook into template-ready format: %v", err)
 	}
 
-	var commonMatched []string
-	for k, v := range a.CommonLabels {
-		if r.IsMatch(k, v) {
-			commonMatched = append(commonMatched, k)
+	// Track which matchers the CommonLabels satisfy, rather than which labels matched; two matchers on the same label must each be satisfied
+	var commonMatched []*WebhookMatcher
+	for _, matcher := range r.Matchers {
+		for k, v := range a.CommonLabels {
+			if matcher.IsMatch(k, v) {
+				commonMatched = append(commonMatched, matcher)
+				break
+			}
 		}
 	}
 	if len(commonMatched) == len(r.Matchers) {
@@ -385,15 +398,17 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 			resp.Body.Close()
 		}()
 
-		if resp.StatusCode != 200 {
+		respData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			respData = []byte(fmt.Sprintf("(not available due to error [%v])", err))
+		}
+
+		// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			if DEBUGLEVEL_DEBUG {
-				respData, err := io.ReadAll(resp.Body)
-				if err != nil {
-					log.Printf("WebhookRouter.SendWebhook HTTP request returned non-200 code %d; response not available due to error [%v]", resp.StatusCode, err)
-				} else {
-					log.Printf("WebhookRouter.SendWebhook HTTP request returned non-200 code %d; response=%s", resp.StatusCode, respData)
-				}
+				log.Printf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, respData)
 			}
+			return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
 		}
 
 		// Successful send
@@ -402,11 +417,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		webhookreqSuccessfulMutex.Unlock()
 
 		if DEBUGLEVEL_TRACE {
-			respData, err := io.ReadAll(resp.Body)
-			if err != nil {
-				respData = []byte("")
-			}
-			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; response=%s", r.DestURL, r.HttpMethod, respData)
+			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
 		}
 	} else {
 		if DEBUGLEVEL_DEBUG {
@@ -636,7 +647,7 @@ func (w *WebhookServer) Start() error {
 
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests_successful",
-		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed",
+		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed (destination answered with a 2xx status)",
 	})
 	prometheus.MustRegister(webhookreqSuccessfulCounter)
 	if DEBUGLEVEL_TRACE {
