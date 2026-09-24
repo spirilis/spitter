@@ -3,10 +3,16 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/spirilis/spitter/alerts"
 	"gopkg.in/yaml.v3"
 )
@@ -312,5 +318,59 @@ func TestReloadRoutersRejectsInvalidMatchRegexp(t *testing.T) {
 	}
 	if routersRejected != 2 {
 		t.Errorf("routersRejected = %d, want 2", routersRejected)
+	}
+}
+
+func TestSendWebhookStatusHandling(t *testing.T) {
+	// SendWebhook increments this counter, which is normally created by WebhookServer.Start
+	savedCounter := webhookreqSuccessfulCounter
+	t.Cleanup(func() { webhookreqSuccessfulCounter = savedCounter })
+
+	tests := []struct {
+		status  int
+		wantErr bool
+	}{
+		{status: http.StatusOK},
+		{status: http.StatusCreated},
+		{status: http.StatusNoContent},
+		{status: http.StatusNotFound, wantErr: true},
+		{status: http.StatusInternalServerError, wantErr: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				w.WriteHeader(tc.status)
+			}))
+			defer srv.Close()
+			webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{Name: "test_webhook_requests_successful"})
+
+			r := &WebhookRouter{
+				DestURL:        srv.URL,
+				HttpMethod:     "POST",
+				ContentType:    "application/yaml",
+				Template:       "{{ .Status }}",
+				Authentication: &WebhookAuthentication{},
+			}
+			err := r.SendWebhook(&alerts.AlertmanagerWebhookTemplateV4{Status: "firing"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("SendWebhook error = %v, wantErr %v", err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), strconv.Itoa(tc.status)) {
+				t.Errorf("SendWebhook error %q does not mention HTTP status %d", err, tc.status)
+			}
+
+			wantCount := 1.0
+			if tc.wantErr {
+				wantCount = 0
+			}
+			var m dto.Metric
+			if err := webhookreqSuccessfulCounter.Write(&m); err != nil {
+				t.Fatalf("Error reading successful webhook counter: %v", err)
+			}
+			if got := m.GetCounter().GetValue(); got != wantCount {
+				t.Errorf("successful webhook counter = %v, want %v", got, wantCount)
+			}
+		})
 	}
 }

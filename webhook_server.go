@@ -290,9 +290,9 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 	tp := template.Must(template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template))
 	if err := tp.Execute(b, a); err == nil {
-        if DEBUGLEVEL_TRACE {
-            log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
-        }
+		if DEBUGLEVEL_TRACE {
+			log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
+		}
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 		}
@@ -334,15 +334,17 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		}
 		defer resp.Body.Close()
 
-		if resp.StatusCode != 200 {
+		respData, err := io.ReadAll(resp.Body)
+		if err != nil {
+			respData = []byte(fmt.Sprintf("(not available due to error [%v])", err))
+		}
+
+		// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
 			if DEBUGLEVEL_DEBUG {
-				respData, err := io.ReadAll(resp.Body)
-				if err != nil {
-					log.Printf("WebhookRouter.SendWebhook HTTP request returned non-200 code %d; response not available due to error [%v]", resp.StatusCode, err)
-				} else {
-					log.Printf("WebhookRouter.SendWebhook HTTP request returned non-200 code %d; response=%s", resp.StatusCode, respData)
-				}
+				log.Printf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, respData)
 			}
+			return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
 		}
 
 		// Successful send
@@ -351,11 +353,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		webhookreqSuccessfulMutex.Unlock()
 
 		if DEBUGLEVEL_TRACE {
-			respData, err := io.ReadAll(resp.Body)
-			if err != nil {
-				respData = []byte("")
-			}
-			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; response=%s", r.DestURL, r.HttpMethod, respData)
+			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
 		}
 	} else {
 		if DEBUGLEVEL_DEBUG {
@@ -585,7 +583,7 @@ func (w *WebhookServer) Start() error {
 
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests_successful",
-		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed",
+		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed (destination answered with a 2xx status)",
 	})
 	prometheus.MustRegister(webhookreqSuccessfulCounter)
 	if DEBUGLEVEL_TRACE {
