@@ -1,0 +1,11 @@
+spitter:
+  alertmanagerURL: https://alertmanager.example.com
+  prometheusURL: https://prometheus.example.com
+  routers:
+    - url: http://receiver.example.com/hook
+      contentType: application/json
+      template: |-
+        {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+      matchers:
+        - label: severity
+          match_re: ".*"
