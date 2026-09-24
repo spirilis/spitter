@@ -1,0 +1,240 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "definitions": {
+    "stringMap": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "objectList": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "configRef": {
+      "type": "object",
+      "properties": {
+        "configMap": { "type": "string" },
+        "secret": { "type": "string" }
+      }
+    }
+  },
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 0 },
+    "image": {
+      "type": "object",
+      "properties": {
+        "registry": { "type": "string" },
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": ["string", "number"] },
+        "digest": { "type": "string", "pattern": "^$|^sha256:[a-f0-9]{64}$" },
+        "pullPolicy": { "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "$ref": "#/definitions/objectList" },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "spitter": {
+      "type": "object",
+      "properties": {
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "alertmanagerURL": { "type": "string" },
+        "prometheusURL": { "type": "string" },
+        "metricsPath": { "type": "string", "pattern": "^/" },
+        "routers": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["url", "template", "matchers"],
+            "properties": {
+              "url": { "type": "string", "minLength": 1 },
+              "method": { "type": "string" },
+              "contentType": { "type": "string" },
+              "template": { "type": "string", "minLength": 1 },
+              "auth": { "type": "object" },
+              "tls": {
+                "type": "object",
+                "properties": {
+                  "insecureSkipVerify": { "type": "boolean" },
+                  "caFile": { "type": "string" }
+                }
+              },
+              "matchers": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["label"],
+                  "properties": {
+                    "label": { "type": "string" },
+                    "match": { "type": "string" },
+                    "match_re": { "type": "string" }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "configInSecret": { "type": "boolean" },
+        "existingConfig": {
+          "allOf": [
+            { "$ref": "#/definitions/configRef" },
+            { "properties": { "key": { "type": "string", "minLength": 1 } } }
+          ]
+        },
+        "additionalRouters": {
+          "allOf": [
+            { "$ref": "#/definitions/configRef" },
+            {
+              "properties": {
+                "mountPath": { "type": "string", "pattern": "^/" },
+                "watchInterval": {
+                  "type": "string",
+                  "pattern": "^([0-9]+(\\.[0-9]+)?(ns|us|µs|ms|s|m|h))+$|^0$"
+                }
+              }
+            }
+          ]
+        },
+        "extraArgs": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "serviceAccount": {
+      "type": "object",
+      "properties": {
+        "create": { "type": "boolean" },
+        "automount": { "type": "boolean" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "name": { "type": "string" }
+      }
+    },
+    "podAnnotations": { "$ref": "#/definitions/stringMap" },
+    "podLabels": { "$ref": "#/definitions/stringMap" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "service": {
+      "type": "object",
+      "properties": {
+        "type": { "enum": ["ClusterIP", "NodePort", "LoadBalancer"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "nodePort": { "type": ["integer", "null"], "minimum": 1, "maximum": 65535 },
+        "externalTrafficPolicy": { "enum": ["", "Cluster", "Local"] },
+        "loadBalancerClass": { "type": "string" },
+        "loadBalancerSourceRanges": { "type": "array", "items": { "type": "string" } },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "labels": { "$ref": "#/definitions/stringMap" },
+        "extraPorts": { "$ref": "#/definitions/objectList" }
+      }
+    },
+    "ingress": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "className": { "type": "string" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "labels": { "$ref": "#/definitions/stringMap" },
+        "hosts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["paths"],
+            "properties": {
+              "host": { "type": "string" },
+              "paths": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["path"],
+                  "properties": {
+                    "path": { "type": "string", "pattern": "^/" },
+                    "pathType": { "enum": ["Prefix", "Exact", "ImplementationSpecific"] }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "tls": { "$ref": "#/definitions/objectList" }
+      }
+    },
+    "httpRoute": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "annotations": { "$ref": "#/definitions/stringMap" },
+        "labels": { "$ref": "#/definitions/stringMap" },
+        "parentRefs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+              "name": { "type": "string", "minLength": 1 },
+              "namespace": { "type": "string" },
+              "sectionName": { "type": "string" },
+              "port": { "type": "integer" }
+            }
+          }
+        },
+        "hostnames": { "type": "array", "items": { "type": "string" } },
+        "rules": { "$ref": "#/definitions/objectList" }
+      },
+      "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+      "then": { "properties": { "parentRefs": { "minItems": 1 } } }
+    },
+    "metrics": {
+      "type": "object",
+      "properties": {
+        "podMonitor": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "labels": { "$ref": "#/definitions/stringMap" },
+            "annotations": { "$ref": "#/definitions/stringMap" },
+            "interval": { "type": "string" },
+            "scrapeTimeout": { "type": "string" },
+            "relabelings": { "$ref": "#/definitions/objectList" },
+            "metricRelabelings": { "$ref": "#/definitions/objectList" },
+            "extraEndpoints": { "$ref": "#/definitions/objectList" }
+          }
+        }
+      }
+    },
+    "livenessProbe": { "type": "object" },
+    "readinessProbe": { "type": "object" },
+    "lifecycle": { "type": "object" },
+    "resources": { "type": "object" },
+    "autoscaling": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minReplicas": { "type": "integer", "minimum": 1 },
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "targetCPUUtilizationPercentage": { "type": "integer", "minimum": 1 },
+        "targetMemoryUtilizationPercentage": { "type": "integer", "minimum": 1 },
+        "metrics": { "$ref": "#/definitions/objectList" },
+        "behavior": { "type": "object" }
+      }
+    },
+    "podDisruptionBudget": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "minAvailable": { "type": ["integer", "string"] },
+        "maxUnavailable": { "type": ["integer", "string"] }
+      }
+    },
+    "env": { "$ref": "#/definitions/objectList" },
+    "envFrom": { "$ref": "#/definitions/objectList" },
+    "extraVolumes": { "$ref": "#/definitions/objectList" },
+    "extraVolumeMounts": { "$ref": "#/definitions/objectList" },
+    "initContainers": { "$ref": "#/definitions/objectList" },
+    "extraContainers": { "$ref": "#/definitions/objectList" },
+    "revisionHistoryLimit": { "type": "integer", "minimum": 0 },
+    "priorityClassName": { "type": "string" },
+    "nodeSelector": { "$ref": "#/definitions/stringMap" },
+    "tolerations": { "$ref": "#/definitions/objectList" },
+    "affinity": { "type": "object" },
+    "topologySpreadConstraints": { "$ref": "#/definitions/objectList" }
+  }
+}

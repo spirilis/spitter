@@ -1,5 +1,5 @@
 {{- if .Values.autoscaling.enabled }}
-  {{- if .Values.autoscaling.custom }}
+{{- $as := .Values.autoscaling }}
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
@@ -11,37 +11,31 @@ spec:
     apiVersion: apps/v1
     kind: Deployment
     name: {{ include "spitter.fullname" . }}
-  {{- toYaml .Values.autoscaling.custom | nindent 2 }}
-  {{- else }}
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: {{ include "spitter.fullname" . }}
-  labels:
-    {{- include "spitter.labels" . | nindent 4 }}
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: {{ include "spitter.fullname" . }}
-  minReplicas: {{ .Values.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.autoscaling.maxReplicas }}
+  minReplicas: {{ $as.minReplicas }}
+  maxReplicas: {{ $as.maxReplicas }}
   metrics:
-    {{- if .Values.autoscaling.targetCPUUtilizationPercentage }}
+    {{- if $as.metrics }}
+    {{- toYaml $as.metrics | nindent 4 }}
+    {{- else }}
+    {{- with $as.targetCPUUtilizationPercentage }}
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetCPUUtilizationPercentage }}
+          averageUtilization: {{ . }}
     {{- end }}
-    {{- if .Values.autoscaling.targetMemoryUtilizationPercentage }}
+    {{- with $as.targetMemoryUtilizationPercentage }}
     - type: Resource
       resource:
         name: memory
         target:
           type: Utilization
-          averageUtilization: {{ .Values.autoscaling.targetMemoryUtilizationPercentage }}
+          averageUtilization: {{ . }}
     {{- end }}
+    {{- end }}
+  {{- with $as.behavior }}
+  behavior:
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 {{- end }}

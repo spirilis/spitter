@@ -1,0 +1,27 @@
+spitter:
+  alertmanagerURL: https://alertmanager.example.com
+  prometheusURL: https://prometheus.example.com
+  configInSecret: true
+  routers:
+    - url: https://receiver.example.com/hook
+      contentType: application/json
+      auth:
+        token: not-a-real-token
+      template: |-
+        {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+      matchers:
+        - label: severity
+          match: critical
+httpRoute:
+  enabled: true
+  parentRefs:
+    - name: shared-gateway
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - spitter.example.com
+metrics:
+  podMonitor:
+    enabled: true
+    labels:
+      release: kube-prometheus-stack

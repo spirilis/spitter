@@ -1,0 +1,16 @@
+{{- if include "spitter.generateConfig" . }}
+apiVersion: v1
+kind: {{ ternary "Secret" "ConfigMap" .Values.spitter.configInSecret }}
+metadata:
+  name: {{ include "spitter.configName" . }}
+  labels:
+    {{- include "spitter.labels" . | nindent 4 }}
+{{- if .Values.spitter.configInSecret }}
+type: Opaque
+stringData:
+{{- else }}
+data:
+{{- end }}
+  config.yml: |
+    {{- include "spitter.configFile" . | nindent 4 }}
+{{- end }}

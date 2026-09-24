@@ -3,8 +3,11 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,13 +15,16 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"text/template"
 	"time"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -33,7 +39,10 @@ type WebhookRouter struct {
 	Template       string                 `yaml:"template"`
 	ContentType    string                 `yaml:"contentType,omitempty"`
 	Authentication *WebhookAuthentication `yaml:"auth,omitempty"`
+	TLS            *WebhookTLS            `yaml:"tls,omitempty"`
 	Matchers       []*WebhookMatcher      `yaml:"matchers"`
+	// Set by prepare.  Every reload re-prepares inline routers while requests may still be using them.
+	client atomic.Pointer[http.Client]
 }
 
 func (r *WebhookRouter) Check() error {
@@ -90,7 +99,8 @@ func (wa *WebhookAuthentication) ResolveBearerToken() error {
 			}
 			return err
 		}
-		wa.BearerToken = string(contents)
+		// Token files usually end in a newline, which is not valid in a header value
+		wa.BearerToken = strings.TrimSpace(string(contents))
 	}
 	return nil
 }
@@ -100,9 +110,64 @@ func (wa *WebhookAuthentication) AuthorizationHeader() string {
 		return "Bearer " + wa.BearerToken
 	}
 	if wa.BasicAuth.Username != "" && wa.BasicAuth.Password != "" {
-		return "Basic " + wa.BasicAuth.AuthorizationHeader()
+		return wa.BasicAuth.AuthorizationHeader()
 	}
 	return ""
+}
+
+// webhookClientTimeout bounds each outbound webhook, including reading the response.  Routers are sent to one after
+// another while Alertmanager waits, so an unresponsive destination must not hold up the rest indefinitely.
+const webhookClientTimeout = 30 * time.Second
+
+// WebhookTLS controls how a router verifies its destination's certificate.  Without it, the system roots are used.
+type WebhookTLS struct {
+	InsecureSkipVerify bool   `yaml:"insecureSkipVerify,omitempty"`
+	CAFile             string `yaml:"caFile,omitempty"`
+}
+
+// HTTPClient builds the client a router sends its webhooks with.  A nil WebhookTLS verifies against the system roots.
+func (wt *WebhookTLS) HTTPClient() (*http.Client, error) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	// Webhooks have always gone direct; keep ignoring HTTP_PROXY/HTTPS_PROXY
+	transport.Proxy = nil
+	if wt != nil {
+		tlsConfig := &tls.Config{InsecureSkipVerify: wt.InsecureSkipVerify}
+		if wt.CAFile != "" {
+			caPEM, err := os.ReadFile(wt.CAFile)
+			if err != nil {
+				return nil, fmt.Errorf("reading tls.caFile: %w", err)
+			}
+			// Like Prometheus' ca_file, the CA replaces the system roots rather than adding to them
+			tlsConfig.RootCAs = x509.NewCertPool()
+			if !tlsConfig.RootCAs.AppendCertsFromPEM(caPEM) {
+				return nil, fmt.Errorf("tls.caFile %s contains no PEM certificates", wt.CAFile)
+			}
+		}
+		transport.TLSClientConfig = tlsConfig
+	}
+	return &http.Client{Transport: transport, Timeout: webhookClientTimeout}, nil
+}
+
+// prepare applies a router's defaults and resolves what it needs to send webhooks: its bearer token and HTTP client.
+func (r *WebhookRouter) prepare() error {
+	if r.HttpMethod == "" {
+		r.HttpMethod = "POST"
+	}
+	if r.ContentType == "" {
+		r.ContentType = "application/yaml"
+	}
+	if err := r.Authentication.ResolveBearerToken(); err != nil {
+		return err
+	}
+	client, err := r.TLS.HTTPClient()
+	if err != nil {
+		return err
+	}
+	r.client.Store(client)
+	if r.TLS != nil && r.TLS.InsecureSkipVerify && DEBUGLEVEL_WARNING {
+		log.Printf("Router [URL=\"%s\"] does not verify its destination's TLS certificate (tls.insecureSkipVerify)", r.DestURL)
+	}
+	return nil
 }
 
 // WebhookRouter's Matcher system defined here-
@@ -293,14 +358,9 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		if DEBUGLEVEL_TRACE {
 			log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
 		}
-		tlsConfig := &tls.Config{
-			InsecureSkipVerify: true,
-		}
-		transport := &http.Transport{
-			TLSClientConfig: tlsConfig,
-		}
-		client := &http.Client{
-			Transport: transport,
+		client := r.client.Load()
+		if client == nil {
+			return errors.New("WebhookRouter.SendWebhook error - router was not prepared and has no HTTP client")
 		}
 		req, err := http.NewRequest(r.HttpMethod, r.DestURL, b)
 		if err != nil {
@@ -310,10 +370,10 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 			return fmt.Errorf("WebhookRouter.SendWebhook http.NewRequest error %v", err)
 		}
 
-		// Configure request parameters - content-type, cookies and/or bearer token
+		// Configure request parameters - content-type, cookies and/or bearer token or basic auth
 		req.Header.Set("Content-Type", r.ContentType)
-		if r.Authentication.BearerToken != "" {
-			req.Header.Set("Authorization", r.Authentication.AuthorizationHeader())
+		if authHeader := r.Authentication.AuthorizationHeader(); authHeader != "" {
+			req.Header.Set("Authorization", authHeader)
 		}
 		if r.Authentication.Cookies != nil && len(r.Authentication.Cookies) > 0 {
 			for k, v := range r.Authentication.Cookies {
@@ -330,9 +390,13 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 			if DEBUGLEVEL_DEBUG {
 				log.Printf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
 			}
-			return fmt.Errorf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
+			return fmt.Errorf("WebhookRouter.SendWebhook error submitting HTTP request: %w", err)
 		}
-		defer resp.Body.Close()
+		defer func() {
+			// Drain the body so the connection goes back into the router's pool for the next webhook
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close()
+		}()
 
 		respData, err := io.ReadAll(resp.Body)
 		if err != nil {
@@ -372,6 +436,7 @@ type WebhookServer struct {
 	PrometheusURL             string                `yaml:"prometheusURL"`
 	Routers                   []*WebhookRouter      `yaml:"routers,omitempty"`
 	AdditionalRouterDirectory string                `yaml:"addlRouterDir,omitempty"`
+	AdditionalRouterWatch     time.Duration         `yaml:"addlRouterDirWatchInterval,omitempty"`
 	ReloadTriggerFile         string                `yaml:"reloadTriggerFile,omitempty"`
 	Metrics                   *WebhookServerMetrics `yaml:"metrics,omitempty"`
 	allRouters                []*WebhookRouter
@@ -404,14 +469,11 @@ func (w *WebhookServer) ReloadRouters() error {
 			tmpRoutersRejected++
 			continue
 		}
-		if rt.HttpMethod == "" {
-			rt.HttpMethod = "POST"
-		}
-		if rt.ContentType == "" {
-			rt.ContentType = "application/yaml"
-		}
-		if rt.Authentication.ResolveBearerToken() != nil {
+		if err := rt.prepare(); err != nil {
 			tmpRoutersRejected++
+			if DEBUGLEVEL_DEBUG {
+				log.Printf("Rejecting router [URL=\"%s\"]: %v", rt.DestURL, err)
+			}
 			continue
 		}
 		tmpAllRouters = append(tmpAllRouters, rt)
@@ -438,15 +500,12 @@ func (w *WebhookServer) ReloadRouters() error {
 						if err == nil {
 							// Lint the object to make sure it has the minimum fields
 							if rt.Check() == nil {
-								// Check doesn't verify HTTP Method since we assume POST as a default here.
-								if rt.HttpMethod == "" {
-									rt.HttpMethod = "POST"
-								}
-								if rt.ContentType == "" {
-									rt.ContentType = "application/yaml"
-								}
-								if rt.Authentication.ResolveBearerToken() != nil {
+								// Check doesn't verify HTTP Method since prepare assumes POST as a default.
+								if err := rt.prepare(); err != nil {
 									tmpRoutersRejected++
+									if DEBUGLEVEL_DEBUG {
+										log.Printf("Rejecting router [URL=\"%s\"] from [%s]: %v", rt.DestURL, file.Name(), err)
+									}
 								} else {
 									tmpAllRouters = append(tmpAllRouters, rt)
 									if DEBUGLEVEL_DEBUG {
@@ -519,6 +578,11 @@ func (w *WebhookServer) Start() error {
 	}
 
 	// Load initial set of routers
+	var addlRouterDirSum string
+	if w.AdditionalRouterDirectory != "" && w.AdditionalRouterWatch > 0 {
+		// Fingerprint before the initial load so a change landing mid-load still triggers a reload
+		addlRouterDirSum = routerDirChecksum(w.AdditionalRouterDirectory)
+	}
 	err = w.ReloadRouters()
 	if err != nil {
 		return fmt.Errorf("WebhookServer.Start had an error initializating routers: %v", err)
@@ -645,6 +709,35 @@ func (w *WebhookServer) Start() error {
 		}
 	}
 
+	// Set up AdditionalRouterDirectory watcher for reloading routers when the directory contents change.
+	// This lets a Kubernetes ConfigMap/Secret volume be updated in place without a sidecar touching the ReloadTriggerFile.
+	if w.AdditionalRouterDirectory != "" && w.AdditionalRouterWatch > 0 {
+		go func(lastSum string, w *WebhookServer) {
+			for {
+				time.Sleep(w.AdditionalRouterWatch)
+				sum := routerDirChecksum(w.AdditionalRouterDirectory)
+				if sum == lastSum {
+					continue
+				}
+				lastSum = sum
+				if DEBUGLEVEL_DEBUG {
+					log.Printf("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
+				}
+				err := w.ReloadRouters()
+				if err != nil {
+					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
+					panic("Router directory change-initiated router reload ended in error: " + err.Error())
+				}
+				routerMutex.Lock()
+				rejectedRouters.Set(float64(routersRejected))
+				routerMutex.Unlock()
+			}
+		}(addlRouterDirSum, w)
+		if DEBUGLEVEL_DEBUG {
+			log.Printf("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
+		}
+	}
+
 	// Set up Prometheus metrics config
 	if w.Metrics == nil {
 		w.Metrics = &WebhookServerMetrics{
@@ -681,7 +774,32 @@ func (w *WebhookServer) Start() error {
 	return nil
 }
 
+// routerDirChecksum fingerprints the files ReloadRouters would read from dir.  Symlinks are followed, so the atomic
+// ..data symlink swap Kubernetes performs when updating a ConfigMap/Secret volume shows up as a change.
+func routerDirChecksum(dir string) string {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(dir, file.Name()))
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(h, "%s\x00%d\x00", file.Name(), len(contents))
+		h.Write(contents)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (w *WebhookServer) GetRouters() []*WebhookRouter {
+	// ReloadRouters swaps allRouters under routerMutex while requests are being served
+	routerMutex.Lock()
+	defer routerMutex.Unlock()
 	return w.allRouters
 }
 

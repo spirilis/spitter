@@ -1,0 +1,20 @@
+spitter:
+  alertmanagerURL: https://alertmanager.example.com
+  prometheusURL: https://prometheus.example.com
+  additionalRouters:
+    configMap: spitter-routers
+service:
+  type: NodePort
+  nodePort: 30820
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: spitter.example.com
+      paths:
+        - path: /v4/alertmanager
+          pathType: Prefix
+  tls:
+    - secretName: spitter-tls
+      hosts:
+        - spitter.example.com

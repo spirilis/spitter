@@ -322,7 +322,7 @@ func TestReloadRoutersRejectsInvalidMatchRegexp(t *testing.T) {
 }
 
 func TestSendWebhookStatusHandling(t *testing.T) {
-	// SendWebhook increments this counter, which is normally created by WebhookServer.Start
+	// Each case gets a fresh copy of the counter TestMain installs, so it can check this one send's effect on it
 	savedCounter := webhookreqSuccessfulCounter
 	t.Cleanup(func() { webhookreqSuccessfulCounter = savedCounter })
 
@@ -345,14 +345,7 @@ func TestSendWebhookStatusHandling(t *testing.T) {
 			defer srv.Close()
 			webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{Name: "test_webhook_requests_successful"})
 
-			r := &WebhookRouter{
-				DestURL:        srv.URL,
-				HttpMethod:     "POST",
-				ContentType:    "application/yaml",
-				Template:       "{{ .Status }}",
-				Authentication: &WebhookAuthentication{},
-			}
-			err := r.SendWebhook(&alerts.AlertmanagerWebhookTemplateV4{Status: "firing"})
+			err := newTestRouter(t, srv.URL, nil, nil).SendWebhook(testAlert)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("SendWebhook error = %v, wantErr %v", err, tc.wantErr)
 			}

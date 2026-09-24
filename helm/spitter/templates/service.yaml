@@ -1,71 +1,43 @@
+{{- $svc := .Values.service }}
+{{- $external := or (eq $svc.type "NodePort") (eq $svc.type "LoadBalancer") }}
 apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "spitter.fullname" . }}
   labels:
     {{- include "spitter.labels" . | nindent 4 }}
+    {{- with $svc.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $svc.annotations }}
   annotations:
-    spitter-uri: "/v4/alertmanager/webhook"
-  {{- with .Values.service.annotations }}
-    {{ toYaml . | nindent 4 }}
+    {{- toYaml . | nindent 4 }}
   {{- end }}
 spec:
-  {{- with .Values.service }}
-    {{- if .nodePort.enabled }}
-  type: NodePort
-    {{- else }}
-      {{- if .type }}
-        {{- if eq .type "NodePort" }}
-          {{- fail "For type=NodePort, please set .service.nodePort.enabled to true instead of specifying type: NodePort" }}
-        {{- end }}
-  type: {{ .type }}
-      {{- else }}
-  type: ClusterIP
-      {{- end }}
-    {{- end }}
-    {{- if and .nodePort.enabled .nodePort.externalTrafficPolicy }}
-  externalTrafficPolicy: {{ .nodePort.externalTrafficPolicy }}
-    {{- end }}
-  ports:
-    - port: {{ .port }}
-      {{- if gt (.targetPort | int) 0 }}
-      targetPort: {{ .targetPort | int }}
-      {{- else }}
-      targetPort: {{ $.Values.spitter.port | int }}
-      {{- end }}
-      {{- if and .nodePort.enabled (gt (.nodePort.number | int) 0) }}
-      nodePort: {{ .nodePort.number | int }}
-      {{- end }}
-      protocol: TCP
-      name: http
-      appProtocol: http
-    {{- if .additionalPorts }}{{- $aidx := 0 }}{{- range .additionalPorts }}{{- $aidx = add1 $aidx }}
-    - port: {{ .port | int }}
-      {{- if gt (.targetPort | int) 0 }}
-      targetPort: {{ .targetPort | int }}
-      {{- else }}
-      targetPort: {{ .port | int }}
-      {{- end }}
-      {{- if and $.Values.service.nodePort.enabled (gt (.nodePort | int) 0) }}
-      nodePort: {{ .nodePort | int }}
-      {{- end }}
-      {{- if .protocol }}
-      protocol: {{ .protocol | quote }}
-      {{- else }}
-      protocol: TCP
-      {{- end }}
-      {{- if .name }}
-      name: {{ .name | quote }}
-      {{- else }}
-      name: {{ printf "addl%d" $aidx | quote }}
-      {{- end }}
-      {{- if .appProtocol }}
-      appProtocol: {{ .appProtocol | quote }}
-      {{- end }}
-    {{- end }}{{- end }}
+  type: {{ $svc.type }}
+  {{- if and $external $svc.externalTrafficPolicy }}
+  externalTrafficPolicy: {{ $svc.externalTrafficPolicy }}
   {{- end }}
+  {{- if eq $svc.type "LoadBalancer" }}
+  {{- with $svc.loadBalancerClass }}
+  loadBalancerClass: {{ . }}
+  {{- end }}
+  {{- with $svc.loadBalancerSourceRanges }}
+  loadBalancerSourceRanges:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  {{- end }}
+  ports:
+    - name: http
+      port: {{ $svc.port }}
+      targetPort: http
+      protocol: TCP
+      appProtocol: http
+      {{- if and $external $svc.nodePort }}
+      nodePort: {{ $svc.nodePort }}
+      {{- end }}
+    {{- with $svc.extraPorts }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
   selector:
     {{- include "spitter.selectorLabels" . | nindent 4 }}
-  {{- with .Values.service.customServiceSpec }}
-    {{ toYaml . | nindent 2 }}
-  {{- end }}
