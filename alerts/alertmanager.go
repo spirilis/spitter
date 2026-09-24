@@ -11,7 +11,7 @@ import (
 	"os"
 	"strings"
 
-	"golang.org/x/exp/maps"
+	"maps"
 )
 
 // Supports Alertmanager webhook versions: 4

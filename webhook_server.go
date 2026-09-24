@@ -3,8 +3,10 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -12,13 +14,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sync"
 	"syscall"
 	"text/template"
 	"time"
 
-	"github.com/Masterminds/sprig"
+	"github.com/Masterminds/sprig/v3"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -277,9 +280,9 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 	tp := template.Must(template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template))
 	if err := tp.Execute(b, a); err == nil {
-        if DEBUGLEVEL_TRACE {
-            log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
-        }
+		if DEBUGLEVEL_TRACE {
+			log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
+		}
 		tlsConfig := &tls.Config{
 			InsecureSkipVerify: true,
 		}
@@ -361,6 +364,7 @@ type WebhookServer struct {
 	PrometheusURL             string                `yaml:"prometheusURL"`
 	Routers                   []*WebhookRouter      `yaml:"routers,omitempty"`
 	AdditionalRouterDirectory string                `yaml:"addlRouterDir,omitempty"`
+	AdditionalRouterWatch     time.Duration         `yaml:"addlRouterDirWatchInterval,omitempty"`
 	ReloadTriggerFile         string                `yaml:"reloadTriggerFile,omitempty"`
 	Metrics                   *WebhookServerMetrics `yaml:"metrics,omitempty"`
 	allRouters                []*WebhookRouter
@@ -508,6 +512,11 @@ func (w *WebhookServer) Start() error {
 	}
 
 	// Load initial set of routers
+	var addlRouterDirSum string
+	if w.AdditionalRouterDirectory != "" && w.AdditionalRouterWatch > 0 {
+		// Fingerprint before the initial load so a change landing mid-load still triggers a reload
+		addlRouterDirSum = routerDirChecksum(w.AdditionalRouterDirectory)
+	}
 	err = w.ReloadRouters()
 	if err != nil {
 		return fmt.Errorf("WebhookServer.Start had an error initializating routers: %v", err)
@@ -634,6 +643,35 @@ func (w *WebhookServer) Start() error {
 		}
 	}
 
+	// Set up AdditionalRouterDirectory watcher for reloading routers when the directory contents change.
+	// This lets a Kubernetes ConfigMap/Secret volume be updated in place without a sidecar touching the ReloadTriggerFile.
+	if w.AdditionalRouterDirectory != "" && w.AdditionalRouterWatch > 0 {
+		go func(lastSum string, w *WebhookServer) {
+			for {
+				time.Sleep(w.AdditionalRouterWatch)
+				sum := routerDirChecksum(w.AdditionalRouterDirectory)
+				if sum == lastSum {
+					continue
+				}
+				lastSum = sum
+				if DEBUGLEVEL_DEBUG {
+					log.Printf("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
+				}
+				err := w.ReloadRouters()
+				if err != nil {
+					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
+					panic("Router directory change-initiated router reload ended in error: " + err.Error())
+				}
+				routerMutex.Lock()
+				rejectedRouters.Set(float64(routersRejected))
+				routerMutex.Unlock()
+			}
+		}(addlRouterDirSum, w)
+		if DEBUGLEVEL_DEBUG {
+			log.Printf("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
+		}
+	}
+
 	// Set up Prometheus metrics config
 	if w.Metrics == nil {
 		w.Metrics = &WebhookServerMetrics{
@@ -670,7 +708,32 @@ func (w *WebhookServer) Start() error {
 	return nil
 }
 
+// routerDirChecksum fingerprints the files ReloadRouters would read from dir.  Symlinks are followed, so the atomic
+// ..data symlink swap Kubernetes performs when updating a ConfigMap/Secret volume shows up as a change.
+func routerDirChecksum(dir string) string {
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		return ""
+	}
+	h := sha256.New()
+	for _, file := range files {
+		if file.IsDir() {
+			continue
+		}
+		contents, err := os.ReadFile(filepath.Join(dir, file.Name()))
+		if err != nil {
+			continue
+		}
+		fmt.Fprintf(h, "%s\x00%d\x00", file.Name(), len(contents))
+		h.Write(contents)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 func (w *WebhookServer) GetRouters() []*WebhookRouter {
+	// ReloadRouters swaps allRouters under routerMutex while requests are being served
+	routerMutex.Lock()
+	defer routerMutex.Unlock()
 	return w.allRouters
 }
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"log"
 	"os"
+	"time"
 
 	"github.com/spirilis/spitter/dump"
 
@@ -22,11 +23,12 @@ const ENABLE_HEALTHZ_DEBUG = false
 
 var CLI struct {
 	Router struct {
-		Config        string `optional:"" name:"config" help:"Path to config file defining the WebhookServer parameters"`
-		Alertmanager  string `optional:"" name:"alertmanager" help:"Accessible URL to the root of the Alertmanager webserver"`
-		Prometheus    string `optional:"" name:"prometheus" help:"Accessible URL to the root of the Prometheus webserver"`
-		RouterDir     string `optional:"" name:"routers" help:"Directory full of webhook router YAML or JSON configuration documents"`
-		ReloadTrigger string `optional:"" name:"reload-trigger" help:"File to watch indicating a reload of router config is necessary; file is deleted after reload.  SIGHUP also performs this."`
+		Config        string        `optional:"" name:"config" env:"SPITTER_CONFIG" help:"Path to config file defining the WebhookServer parameters"`
+		Alertmanager  string        `optional:"" name:"alertmanager" env:"SPITTER_ALERTMANAGER_URL" help:"Accessible URL to the root of the Alertmanager webserver"`
+		Prometheus    string        `optional:"" name:"prometheus" env:"SPITTER_PROMETHEUS_URL" help:"Accessible URL to the root of the Prometheus webserver"`
+		RouterDir     string        `optional:"" name:"routers" env:"SPITTER_ROUTERS_DIR" help:"Directory full of webhook router YAML or JSON configuration documents"`
+		RouterWatch   time.Duration `optional:"" name:"routers-watch-interval" env:"SPITTER_ROUTERS_WATCH_INTERVAL" help:"Poll the --routers directory at this interval (e.g. 10s) and reload routers when its contents change.  0 disables."`
+		ReloadTrigger string        `optional:"" name:"reload-trigger" env:"SPITTER_RELOAD_TRIGGER" help:"File to watch indicating a reload of router config is necessary; file is deleted after reload.  SIGHUP also performs this."`
 	} `cmd:"" help:"Run a webhook router server receiving Alertmanager V4 webhooks"`
 	Dump struct {
 		Listen string `optional:"" name:"listen" help:"Hostname or IP address of interface to listen"`
@@ -77,6 +79,9 @@ func main() {
 		}
 		if CLI.Router.RouterDir != "" {
 			configObj.AdditionalRouterDirectory = CLI.Router.RouterDir
+		}
+		if CLI.Router.RouterWatch > 0 {
+			configObj.AdditionalRouterWatch = CLI.Router.RouterWatch
 		}
 		if CLI.Router.ReloadTrigger != "" {
 			configObj.ReloadTriggerFile = CLI.Router.ReloadTrigger
