@@ -176,16 +176,17 @@ func (m *WebhookMatcher) doesRegexpMatch(re string) bool {
 	return m.compiledRegexp.MatchString(re)
 }
 
-func sliceContains(sl []string, val string) bool {
+func matcherListContains(sl []*WebhookMatcher, m *WebhookMatcher) bool {
 	for _, s := range sl {
-		if s == val {
+		if s == m {
 			return true
 		}
 	}
 	return false
 }
 
-func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommonLabels []string) bool {
+// IsMatchingAlert reports whether every one of the router's matchers is satisfied, either by the CommonLabels (matchedCommon) or by the alert's own labels
+func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommon []*WebhookMatcher) bool {
 	if r == nil {
 		log.Println("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
 		return false
@@ -197,34 +198,21 @@ func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCo
 
 	matchCount := 0
 	for _, matcher := range r.Matchers {
-		if sliceContains(matchedCommonLabels, matcher.Label) {
+		if matcherListContains(matchedCommon, matcher) {
 			// Already satisfied this one with the CommonLabels so we count it towards the total # of matched labels
 			matchCount++
 			continue
 		}
 		for k, v := range l.Labels {
 			if matcher.IsMatch(k, v) {
+				// Count each matcher at most once
 				matchCount++
+				break
 			}
 		}
 	}
 
-	return matchCount != len(r.Matchers)
-}
-
-// Another way to check if an alert is good for this; check each commonLabels and alert Labels to see if this ends up true for the # of matchers we have
-func (m *WebhookRouter) IsMatch(label string, value string) bool {
-	if m == nil {
-		log.Println("WebhookRouter.IsMatch error - called with a nil WebhookRouter")
-		return false
-	}
-
-	for _, matcher := range m.Matchers {
-		if matcher.IsMatch(label, value) {
-			return true
-		}
-	}
-	return false
+	return matchCount == len(r.Matchers)
 }
 
 // This accepts an input Alertmanager webhook and prepares it for consumption by the router's template-
@@ -245,10 +233,14 @@ func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4
 		return nil, fmt.Errorf("WebhookRouter.PrepareTemplateData: Error when converting the alertmanager webhook into template-ready format: %v", err)
 	}
 
-	var commonMatched []string
-	for k, v := range a.CommonLabels {
-		if r.IsMatch(k, v) {
-			commonMatched = append(commonMatched, k)
+	// Track which matchers the CommonLabels satisfy, rather than which labels matched; two matchers on the same label must each be satisfied
+	var commonMatched []*WebhookMatcher
+	for _, matcher := range r.Matchers {
+		for k, v := range a.CommonLabels {
+			if matcher.IsMatch(k, v) {
+				commonMatched = append(commonMatched, matcher)
+				break
+			}
 		}
 	}
 	if len(commonMatched) == len(r.Matchers) {

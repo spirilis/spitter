@@ -1,4 +1,4 @@
-module main
+module github.com/spirilis/spitter
 
 require github.com/spirilis/spitter/alerts v0.0.0
 
