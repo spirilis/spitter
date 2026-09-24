@@ -1,153 +1,216 @@
 # Default values for spitter.
-# This is a YAML-formatted file.
-# Declare variables to be passed into your templates.
 
 replicaCount: 1
 
 image:
-  registry: "docker.io"
+  registry: docker.io
   repository: spirilis/spitter
-  pullPolicy: IfNotPresent
-  # Overrides the image tag whose default is the chart appVersion.
+  # Defaults to the chart appVersion.
   tag: ""
-  args: {}  # optional - if not set, the args run the entrypoint with "router" and CLI arguments reflecting values in the .spitter section below.
-
-env:
-  # key: value
-  # key:
-  #   valueFrom:
-  #     <valueFrom clause>
-
-envFrom:
-  configMap: ""
-  secret: ""
-
-# Spitter can auto-generate its configuration file configmap, but supplying additionalRouters means you must supply that configmap ahead of time
-spitter:
-  port: 9820  # This is assumed; it is the default port if no port is given in the config.yml in your spitter-config configmap.
-              # If this listener port differs in your own config file, override this when installing the helm chart.
-  router:
-    config:
-      autogenerate: true
-      configMap: spitter-helm-config
-      key: config.yml
-    routers: {} # optional - static set of router configs - only relevant if .spitter.router.config.autogenerate is true
-    additionalRouters:
-      configMap: {}  # this is the name of a configmap, all its keys are assumed to be router configs
-      mountPath: /spitter
-  reloadSignal:
-    path: /var/run/spitter-reload
-    file: reload.txt
-  alertmanagerURL: {}
-  prometheusURL: {}
-
-extraContainers: {}
-#  - name: gateway
-#    <other container spec yaml here>
-
-initContainers: {}
-#  - name: perm-fix
-#    <other container spec yaml here>
-
-extraVolumes: {}
+  # Pin the image by digest (sha256:...); takes precedence over tag.
+  digest: ""
+  pullPolicy: IfNotPresent
 
 imagePullSecrets: []
 nameOverride: ""
 fullnameOverride: ""
 
+spitter:
+  # Port spitter listens on inside the pod.  With existingConfig, set this to the listen.port in your config file.
+  port: 9820
+
+  # Externally reachable base URLs for Alertmanager and Prometheus.  Links inside each alert (externalURL,
+  # generatorURL) are rewritten onto these so they work outside the cluster.
+  # Required unless existingConfig is used; when it is, a non-empty value overrides the config file.
+  alertmanagerURL: ""
+  prometheusURL: ""
+
+  # Path serving Prometheus metrics.  With existingConfig, set this to the metrics.path in your config file.
+  metricsPath: /metrics
+
+  # Webhook routers rendered into the generated config file; see examples/webhook_server.yml for the format.
+  # Pods are rolled automatically when these change.
+  routers: []
+  # - url: https://receiver.example.com/hook
+  #   method: POST
+  #   contentType: application/json
+  #   template: |-
+  #     {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+  #   matchers:
+  #     - label: severity
+  #       match_re: "critical|warning"
+
+  # Store the generated config file in a Secret instead of a ConfigMap.  Use this when the inline routers above
+  # carry credentials (auth.token, auth.basicAuth, auth.cookies).
+  configInSecret: false
+
+  # Use an existing ConfigMap or Secret that holds the complete spitter config file instead of generating one.
+  # routers and configInSecret are ignored when either is set.
+  existingConfig:
+    configMap: ""
+    secret: ""
+    key: config.yml
+
+  # Mount an existing ConfigMap or Secret whose keys are each a single router document (YAML or JSON).
+  # spitter polls the mounted directory and hot-reloads its routers when the ConfigMap/Secret is edited,
+  # no pod restart needed.  Works alongside inline routers and existingConfig.
+  additionalRouters:
+    configMap: ""
+    secret: ""
+    mountPath: /etc/spitter/routers.d
+    # Polling interval as a Go duration; "0s" disables hot reload.
+    watchInterval: 10s
+
+  # Extra command-line arguments for "spitter router".
+  extraArgs: []
+
 serviceAccount:
-  # Specifies whether a service account should be created
   create: true
-  # Annotations to add to the service account
+  # spitter never talks to the Kubernetes API, so the token is not mounted by default.
+  automount: false
   annotations: {}
-  # The name of the service account to use.
-  # If not set and create is true, a name is generated using the fullname template
+  # Defaults to the release fullname when create is true, or "default" when it is false.
   name: ""
 
 podAnnotations: {}
+podLabels: {}
 
-podSecurityContext: {}
-  # fsGroup: 2000
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
 
-securityContext: {}
-  # capabilities:
-  #   drop:
-  #   - ALL
-  # readOnlyRootFilesystem: true
-  # runAsNonRoot: true
-  # runAsUser: 1000
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
 
 service:
+  # ClusterIP, NodePort or LoadBalancer.
   type: ClusterIP
   port: 80
-  # targetPort: 80  # optional - if empty, .spitter.port is used instead
-  nodePort:
-    enabled: false
-    number: 0  # optionally specify nodePort - 30000-32767
-    externalTrafficPolicy: Cluster
+  # Fixed node port for NodePort/LoadBalancer; leave null to let Kubernetes allocate one.
+  nodePort: null
+  # Cluster or Local; only applies to NodePort/LoadBalancer.
+  externalTrafficPolicy: ""
+  # Only apply to LoadBalancer.
+  loadBalancerClass: ""
+  loadBalancerSourceRanges: []
   annotations: {}
-  additionalPorts: {}
-  # if you have sidecar containers exposing ports-
-  # - port: 3200
-  #   name: metrics  # optional, uses autogenerated names like addl1, addl2, addl3 etc. if blank
-  #   targetPort: 3200 # optional
-  #   nodePort: 0  # optional - can set static node port# if .service.nodePort.enabled is true
-  #   protocol: TCP # optional - defaults to TCP
-  #   appProtocol: "" # optional - define the protocol spec for this port
-  customServiceSpec: {} # optional - any other directives you want to put into the Service .spec, such as loadBalancerSourceRanges, ipFamilies, etc.
-                        # Do not override type:, ports:, selector: or externalTrafficPolicy: here
+  labels: {}
+  # Additional ServicePort entries, e.g. for ports exposed by extraContainers.
+  extraPorts: []
 
+# Default paths only expose the webhook endpoint (/v4/alertmanager/webhook), keeping /metrics and /healthz internal.
 ingress:
   enabled: false
   className: ""
   annotations: {}
-    # kubernetes.io/ingress.class: nginx
-    # kubernetes.io/tls-acme: "true"
+  labels: {}
   hosts:
-    - host: chart-example.local
+    - host: spitter.example.com
       paths:
-        - path: /
-          pathType: ImplementationSpecific
-          # backend: {}
+        - path: /v4/alertmanager
+          pathType: Prefix
   tls: []
-  #  - secretName: chart-example-tls
-  #    hosts:
-  #      - chart-example.local
+  # - secretName: spitter-tls
+  #   hosts:
+  #     - spitter.example.com
 
-# Prometheus support creates a PodMonitor object for a prometheus-operator installation.
-prometheus:
+# Gateway API HTTPRoute (gateway.networking.k8s.io/v1).  The Gateway itself is not managed by this chart; its
+# listener must allow routes from this release's namespace.
+httpRoute:
   enabled: false
   annotations: {}
-  endpoints:
-    - port: http
-      path: /metrics
-      interval: 60s
-  # NOTE: Port must be a string name matching the given name for the prometheus port in your container or sidecar, listed above.
-  # Other fields available at: https://github.com/prometheus-operator/prometheus-operator/blob/master/Documentation/api.md#podmetricsendpoint
-  # (the contents of endpoints: is copied wholesale into the podMetricsEndpoints field of a PodMonitor object)
+  labels: {}
+  # Gateways (and optionally listeners, via sectionName) to attach to.
+  parentRefs:
+    - name: gateway
+      # namespace: gateway-system
+      # sectionName: https
+  hostnames:
+    - spitter.example.com
+  # Each rule is passed through as-is (matches, filters, timeouts, ...) with backendRefs pointing at the spitter
+  # Service.  An empty list routes everything on the hostnames to spitter.
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /v4/alertmanager
+      # timeouts:
+      #   request: 30s
+
+metrics:
+  # prometheus-operator PodMonitor scraping spitter.metricsPath on the http port.
+  podMonitor:
+    enabled: false
+    # e.g. release: kube-prometheus-stack, to match your Prometheus podMonitorSelector
+    labels: {}
+    annotations: {}
+    interval: 60s
+    scrapeTimeout: ""
+    relabelings: []
+    metricRelabelings: []
+    # Additional podMetricsEndpoints, e.g. for extraContainers.
+    extraEndpoints: []
+
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 20
+readinessProbe:
+  httpGet:
+    path: /healthz
+    port: http
+  periodSeconds: 10
+
+# Container lifecycle hooks.  The image has no shell, so use the native sleep action (Kubernetes 1.30+) to give
+# ingress controllers/gateways time to drop a terminating pod before it stops accepting webhooks:
+lifecycle: {}
+  # preStop:
+  #   sleep:
+  #     seconds: 5
 
 resources: {}
-  # We usually recommend not to specify default resources and to leave this as a conscious
-  # choice for the user. This also increases chances charts run on environments with little
-  # resources, such as Minikube. If you do want to specify resources, uncomment the following
-  # lines, adjust them as necessary, and remove the curly braces after 'resources:'.
-  # limits:
-  #   cpu: 100m
-  #   memory: 128Mi
   # requests:
-  #   cpu: 100m
+  #   cpu: 10m
+  #   memory: 32Mi
+  # limits:
   #   memory: 128Mi
 
 autoscaling:
   enabled: false
   minReplicas: 1
-  maxReplicas: 100
+  maxReplicas: 5
   targetCPUUtilizationPercentage: 80
   # targetMemoryUtilizationPercentage: 80
-  # custom: {}  # optional - specify a custom spec: for the HPA, MINUS the scaleTargetRef: which is auto-filled by this helm chart
+  # Replaces the CPU/memory targets above when set.
+  metrics: []
+  behavior: {}
 
+podDisruptionBudget:
+  enabled: false
+  minAvailable: 1
+  # maxUnavailable: 1
+
+# Plain lists of EnvVar / EnvFromSource objects.
+env: []
+envFrom: []
+
+extraVolumes: []
+extraVolumeMounts: []
+initContainers: []
+extraContainers: []
+
+revisionHistoryLimit: 10
+priorityClassName: ""
 nodeSelector: {}
-
 tolerations: []
-
 affinity: {}
+topologySpreadConstraints: []

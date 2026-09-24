@@ -60,3 +60,79 @@ Create the name of the service account to use
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}
 {{- end }}
+
+{{/*
+Container image reference; a digest takes precedence over the tag.
+*/}}
+{{- define "spitter.image" -}}
+{{- $repo := .Values.image.repository }}
+{{- with .Values.image.registry }}
+{{- $repo = printf "%s/%s" . $repo }}
+{{- end }}
+{{- if .Values.image.digest }}
+{{- printf "%s@%s" $repo .Values.image.digest }}
+{{- else }}
+{{- printf "%s:%s" $repo (default .Chart.AppVersion .Values.image.tag | toString) }}
+{{- end }}
+{{- end }}
+
+{{/*
+Name of the chart-generated config ConfigMap/Secret.
+*/}}
+{{- define "spitter.configName" -}}
+{{- printf "%s-config" (include "spitter.fullname" .) | trunc 63 | trimSuffix "-" }}
+{{- end }}
+
+{{/*
+Non-empty when the chart generates the spitter config file (no existingConfig given).
+*/}}
+{{- define "spitter.generateConfig" -}}
+{{- with .Values.spitter.existingConfig }}
+{{- if not (or .configMap .secret) }}true{{ end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Non-empty when an additional routers ConfigMap/Secret is mounted.
+*/}}
+{{- define "spitter.hasAdditionalRouters" -}}
+{{- with .Values.spitter.additionalRouters }}
+{{- if or .configMap .secret }}true{{ end }}
+{{- end }}
+{{- end }}
+
+{{/*
+Generated spitter config file.  Leaving listen.host empty binds all interfaces, including IPv6.
+*/}}
+{{- define "spitter.configFile" -}}
+{{- $s := .Values.spitter }}
+{{- $cfg := dict
+  "listen" (dict "port" ($s.port | int))
+  "alertmanagerURL" (required "spitter.alertmanagerURL is required unless spitter.existingConfig is set" $s.alertmanagerURL)
+  "prometheusURL" (required "spitter.prometheusURL is required unless spitter.existingConfig is set" $s.prometheusURL)
+  "metrics" (dict "path" $s.metricsPath)
+}}
+{{- with $s.routers }}
+{{- $_ := set $cfg "routers" . }}
+{{- end }}
+{{- toYaml $cfg }}
+{{- end }}
+
+{{/*
+Reject contradictory settings early instead of producing a crash-looping pod.
+*/}}
+{{- define "spitter.validate" -}}
+{{- $s := .Values.spitter }}
+{{- if and $s.existingConfig.configMap $s.existingConfig.secret }}
+{{- fail "spitter.existingConfig: set configMap or secret, not both" }}
+{{- end }}
+{{- if and $s.additionalRouters.configMap $s.additionalRouters.secret }}
+{{- fail "spitter.additionalRouters: set configMap or secret, not both" }}
+{{- end }}
+{{- if and (include "spitter.generateConfig" .) (not $s.routers) (not (include "spitter.hasAdditionalRouters" .)) }}
+{{- fail "spitter needs at least one router: set spitter.routers, spitter.additionalRouters or spitter.existingConfig" }}
+{{- end }}
+{{- if and .Values.httpRoute.enabled (not .Values.httpRoute.parentRefs) }}
+{{- fail "httpRoute.parentRefs must list at least one Gateway when httpRoute.enabled is true" }}
+{{- end }}
+{{- end }}

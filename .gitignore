@@ -27,5 +27,5 @@ go.work.sum
 
 # Local configuration not to be committed upstream
 examples/*_local.yml
-docker/Dockerfile.local
+Dockerfile.local
 tmp/*

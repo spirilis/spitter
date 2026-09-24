@@ -1,0 +1,52 @@
+{{- $fullName := include "spitter.fullname" . }}
+{{- $webhookPath := "/v4/alertmanager/webhook" }}
+{{- $svc := .Values.service }}
+spitter is running as {{ $fullName }} in namespace {{ .Release.Namespace }}.
+
+Point an Alertmanager receiver at it; from inside the cluster:
+
+  receivers:
+    - name: spitter
+      webhook_configs:
+        - url: http://{{ $fullName }}.{{ .Release.Namespace }}.svc:{{ $svc.port }}{{ $webhookPath }}
+          send_resolved: true
+{{- if eq $svc.type "NodePort" }}
+
+From outside the cluster through the NodePort Service:
+
+  NODE_PORT=$(kubectl get svc -n {{ .Release.Namespace }} {{ $fullName }} -o jsonpath='{.spec.ports[?(@.name=="http")].nodePort}')
+  NODE_IP=$(kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+  echo "http://${NODE_IP}:${NODE_PORT}{{ $webhookPath }}"
+{{- else if eq $svc.type "LoadBalancer" }}
+
+From outside the cluster through the LoadBalancer Service (the address may take a minute to appear):
+
+  kubectl get svc -n {{ .Release.Namespace }} {{ $fullName }} -w
+  -> http://<EXTERNAL-IP>:{{ $svc.port }}{{ $webhookPath }}
+{{- end }}
+{{- if .Values.ingress.enabled }}
+
+Through the Ingress:
+{{- range .Values.ingress.hosts }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host | default "<ingress address>" }}{{ $webhookPath }}
+{{- end }}
+{{- end }}
+{{- if .Values.httpRoute.enabled }}
+
+Through the Gateway API HTTPRoute {{ $fullName }} (http or https depending on the Gateway listener):
+{{- range (.Values.httpRoute.hostnames | default (list "<gateway address>")) }}
+  https://{{ . }}{{ $webhookPath }}
+{{- end }}
+
+  Confirm every parent Gateway accepted the route:
+  kubectl get httproute -n {{ .Release.Namespace }} {{ $fullName }} -o jsonpath='{range .status.parents[*]}{.parentRef.name}: {.conditions[?(@.type=="Accepted")].status}{"\n"}{end}'
+{{- end }}
+{{- if include "spitter.hasAdditionalRouters" . }}
+
+Routers in {{ .Values.spitter.additionalRouters.configMap | default .Values.spitter.additionalRouters.secret }} are mounted at {{ .Values.spitter.additionalRouters.mountPath }}
+{{- if .Values.spitter.additionalRouters.watchInterval }}
+and reloaded within about {{ .Values.spitter.additionalRouters.watchInterval }} of the kubelet syncing an edit (typically up to a minute).
+{{- else }}
+and are only re-read when a pod restarts.
+{{- end }}
+{{- end }}
