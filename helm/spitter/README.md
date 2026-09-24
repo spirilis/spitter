@@ -101,7 +101,8 @@ There are three ways to provide routers, and they can be combined:
 
 Routers can hold credentials (`auth.token`, `auth.basicAuth`, `auth.cookies`), so prefer `configInSecret` or a
 Secret for `additionalRouters` in that case.  `auth.tokenFile` also works with a Secret mounted via
-`extraVolumes`/`extraVolumeMounts`.
+`extraVolumes`/`extraVolumeMounts`, as does `tls.caFile` for a destination signed by a private CA.  HTTPS
+certificates are verified by default; see the [spitter README](../../README.md#router-authentication-and-tls).
 
 ## Values
 

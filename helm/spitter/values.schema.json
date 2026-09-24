@@ -51,6 +51,13 @@
               "contentType": { "type": "string" },
               "template": { "type": "string", "minLength": 1 },
               "auth": { "type": "object" },
+              "tls": {
+                "type": "object",
+                "properties": {
+                  "insecureSkipVerify": { "type": "boolean" },
+                  "caFile": { "type": "string" }
+                }
+              },
               "matchers": {
                 "type": "array",
                 "minItems": 1,
