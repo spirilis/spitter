@@ -49,6 +49,16 @@ func (r *WebhookRouter) Check() error {
 	if len(r.Matchers) < 1 {
 		return errors.New("no label matchers")
 	}
+	for _, m := range r.Matchers {
+		if m == nil {
+			return errors.New("nil label matcher")
+		}
+		// Compile match_re now so a bad expression rejects the router at load time instead of failing on every alert
+		if err := m.compile(); err != nil {
+			log.Printf("Rejecting router for URL [%s]: label matcher [%s] has an invalid match_re: %v", r.DestURL, m, err)
+			return fmt.Errorf("label matcher [%s] has an invalid match_re: %v", m, err)
+		}
+	}
 	if r.Authentication == nil {
 		r.Authentication = &WebhookAuthentication{}
 	}
@@ -161,16 +171,27 @@ func (m *WebhookMatcher) IsMatch(label string, value string) bool {
 	return false
 }
 
+// compile parses MatchRegexp once; WebhookRouter.Check calls it so routers are fully compiled before they handle alerts
+func (m *WebhookMatcher) compile() error {
+	if m.MatchRegexp == "" || m.compiledRegexp != nil {
+		return nil
+	}
+	rcomp, err := regexp.Compile(m.MatchRegexp)
+	if err != nil {
+		return err
+	}
+	m.compiledRegexp = rcomp
+	return nil
+}
+
 func (m *WebhookMatcher) doesRegexpMatch(re string) bool {
-	if m == nil {
+	if m == nil || m.MatchRegexp == "" {
 		return false
 	}
-	if m.compiledRegexp == nil {
-		rcomp, err := regexp.Compile(m.MatchRegexp)
-		if err != nil {
-			log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
-		}
-		m.compiledRegexp = rcomp
+	// Normally a no-op since Check() already compiled it; covers matchers that never went through Check()
+	if err := m.compile(); err != nil {
+		log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
+		return false
 	}
 
 	return m.compiledRegexp.MatchString(re)

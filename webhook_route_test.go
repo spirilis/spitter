@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/spirilis/spitter/alerts"
@@ -217,5 +219,98 @@ func TestPrepareTemplateDataFiltering(t *testing.T) {
 				t.Errorf("PrepareTemplateData kept alerts %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRouterCheckMatchers(t *testing.T) {
+	tests := []struct {
+		name     string
+		matchers []*WebhookMatcher
+		wantErr  bool
+	}{
+		{
+			name:     "valid match and match_re",
+			matchers: []*WebhookMatcher{{Label: "severity", MatchString: "error"}, {Label: "application", MatchRegexp: ".*our-company.*"}},
+		},
+		{
+			name:     "invalid match_re",
+			matchers: []*WebhookMatcher{{Label: "severity", MatchString: "error"}, {Label: "application", MatchRegexp: "our-(company"}},
+			wantErr:  true,
+		},
+		{
+			name:     "nil matcher",
+			matchers: []*WebhookMatcher{nil},
+			wantErr:  true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &WebhookRouter{DestURL: "http://destination/webhook", Template: "{{ .Status }}", Matchers: tc.matchers}
+			if err := r.Check(); (err != nil) != tc.wantErr {
+				t.Errorf("Check() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// A matcher that never went through Check() (e.g. built directly) must not panic on a bad match_re
+func TestInvalidMatchRegexpDoesNotMatch(t *testing.T) {
+	m := &WebhookMatcher{Label: "severity", MatchRegexp: "err(or"}
+	if m.IsMatch("severity", "error") {
+		t.Errorf("IsMatch with invalid match_re returned true, want false")
+	}
+	a := &alerts.AlertmanagerWebhookInputV4{
+		Version:      "4",
+		CommonLabels: map[string]string{"severity": "error"},
+		Alerts:       []*alerts.AlertmanagerAlertV4{{Labels: map[string]string{"severity": "error"}}},
+	}
+	if m.HasMatchingAlerts(a) {
+		t.Errorf("HasMatchingAlerts with invalid match_re returned true, want false")
+	}
+}
+
+func TestReloadRoutersRejectsInvalidMatchRegexp(t *testing.T) {
+	routerYAML := func(url, matchRegexp string) string {
+		return fmt.Sprintf("url: %s\ntemplate: \"{{ .Status }}\"\nmatchers:\n  - label: severity\n    match_re: %q\n", url, matchRegexp)
+	}
+	decodeRouter := func(y string) *WebhookRouter {
+		r := new(WebhookRouter)
+		if err := yaml.NewDecoder(bytes.NewBufferString(y)).Decode(r); err != nil {
+			t.Fatalf("Error decoding WebhookRouter object: %v", err)
+		}
+		return r
+	}
+
+	// Cover both places routers come from: the main config and the additional router directory
+	dir := t.TempDir()
+	for name, contents := range map[string]string{
+		"bad.yml":  routerYAML("http://bad-dir", "err(or"),
+		"good.yml": routerYAML("http://good-dir", "err.*"),
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(contents), 0o644); err != nil {
+			t.Fatalf("Error writing router file: %v", err)
+		}
+	}
+	w := &WebhookServer{
+		Routers: []*WebhookRouter{
+			decodeRouter(routerYAML("http://good-inline", "err.*")),
+			decodeRouter(routerYAML("http://bad-inline", "err(or")),
+		},
+		AdditionalRouterDirectory: dir,
+	}
+
+	if err := w.ReloadRouters(); err != nil {
+		t.Fatalf("ReloadRouters error: %v", err)
+	}
+	var urls []string
+	for _, r := range w.GetRouters() {
+		urls = append(urls, r.DestURL)
+	}
+	if fmt.Sprint(urls) != "[http://good-inline http://good-dir]" {
+		t.Errorf("ReloadRouters kept routers %v, want [http://good-inline http://good-dir]", urls)
+	}
+	if routersRejected != 2 {
+		t.Errorf("routersRejected = %d, want 2", routersRejected)
 	}
 }
