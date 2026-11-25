@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -33,6 +34,22 @@ var CLI struct {
 	} `cmd:"" help:"Run a simple webserver that dumps its requests to stdout"`
 }
 
+// loadConfigFile reads the WebhookServer config.  Keys it does not know are an error: a misspelled one would
+// otherwise be dropped without a word.
+func loadConfigFile(path string) (*WebhookServer, error) {
+	cf, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading Router config file: %v", err)
+	}
+	configObj := new(WebhookServer)
+	dec := yaml.NewDecoder(bytes.NewReader(cf))
+	dec.SetStrict(true)
+	if err := dec.Decode(configObj); err != nil {
+		return nil, fmt.Errorf("Error unmarshalling Router config from file [%s]: %v", path, err)
+	}
+	return configObj, nil
+}
+
 func main() {
 	ctx := kong.Parse(&CLI)
 	switch ctx.Command() {
@@ -55,16 +72,10 @@ func main() {
 			r.Matchers = append(r.Matchers, m)
 			configObj.Routers = append(configObj.Routers, r)
 		} else {
-			// Read the config file
-			cf, err := os.ReadFile(CLI.Router.Config)
+			var err error
+			configObj, err = loadConfigFile(CLI.Router.Config)
 			if err != nil {
-				log.Fatalf("Error reading Router config file: %v\n", err)
-			}
-			b := bytes.NewBuffer(cf)
-			dec := yaml.NewDecoder(b)
-			err = dec.Decode(configObj)
-			if err != nil {
-				log.Fatalf("Error unmarshalling Router config from file [%s]: %v\n", CLI.Router.Config, err)
+				log.Fatalf("%v\n", err)
 			}
 		}
 		// CLI config option overrides
