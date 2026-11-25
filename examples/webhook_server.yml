@@ -10,6 +10,8 @@ routers:
   contentType: text/plain
   template: |-
     Status: {{ .Status }}
+    Reason: {{ .NotificationReason }}
+    Route labels: {{ .RouteLabels }}
     Alertmanager: {{ .ExternalURL }}
     Orig: {{ .OriginalExternalURL }}
     Alerts:

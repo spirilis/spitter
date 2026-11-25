@@ -7,6 +7,25 @@ functions) and sends the result to its own destination URL.  Links inside alerts
 reachable Alertmanager/Prometheus URLs along the way.  See [`examples/webhook_server.yml`](examples/webhook_server.yml)
 for a config file with routers, and [`PROMETHEUS-METRICS.md`](PROMETHEUS-METRICS.md) for the metrics it exports.
 
+## Template data
+
+Each router's template is a Go [`text/template`](https://pkg.go.dev/text/template) with the sprig functions.  It
+receives the Alertmanager v4 webhook, with these fields:
+
+| Field | Notes |
+| --- | --- |
+| `.Version`, `.GroupKey`, `.TruncatedAlertCount`, `.Status`, `.Receiver` | As sent by Alertmanager (`truncatedAlerts` becomes `.TruncatedAlertCount`). |
+| `.GroupLabels`, `.CommonLabels`, `.CommonAnnotations` | Maps. |
+| `.RouteLabels` | Map of the matching route's rendered `labels:` (Alertmanager 0.34+; empty before). |
+| `.NotificationReason` | Why Alertmanager sent it: `first notification`, `new alerts added`, `some alerts resolved`, `all alerts resolved`, `repeat interval elapsed` or `unknown` (Alertmanager 0.32+; empty before). |
+| `.ExternalURL` / `.OriginalExternalURL` | Alertmanager link rewritten onto the configured Alertmanager URL / as sent. |
+| `.Env` | The process environment.  Anything in it, secrets included, can be rendered into a payload. |
+| `.Alerts` | Only the alerts that match this router's matchers. |
+
+Each alert has `.Status`, `.Labels` and `.Annotations` (with the common ones merged in), `.StartsAt` and `.EndsAt`
+(RFC3339 strings; use sprig's `toDate` to format them), `.GeneratorURL` / `.OriginalGeneratorURL` (rewritten onto
+the configured Prometheus URL / as sent) and `.Fingerprint`.
+
 ## Router authentication and TLS
 
 Each router can authenticate to its destination and choose how the destination's certificate is checked:

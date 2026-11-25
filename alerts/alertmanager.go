@@ -77,6 +77,8 @@ func (r *RoutingConfig) IsInitialized() bool {
 	  "commonLabels": <object>,
 	  "commonAnnotations": <object>,
 	  "externalURL": <string>,           // backlink to the Alertmanager.
+	  "notification_reason": <string>,   // why this notification was sent (Alertmanager 0.32+)
+	  "routeLabels": <object>,           // rendered labels of the matching route (Alertmanager 0.34+)
 	  "alerts": [
 	    {
 	      "status": "<resolved|firing>",
@@ -100,7 +102,9 @@ type AlertmanagerWebhookInputV4 struct {
 	GroupLabels         map[string]string      `yaml:"groupLabels"`       // K=V map
 	CommonLabels        map[string]string      `yaml:"commonLabels"`      // K=V map
 	CommonAnnotations   map[string]string      `yaml:"commonAnnotations"` // K=V map
+	RouteLabels         map[string]string      `yaml:"routeLabels"`       // K=V map; Alertmanager 0.34+ (route "labels:")
 	ExternalURL         string                 `yaml:"externalURL"`
+	NotificationReason  string                 `yaml:"notification_reason"` // Alertmanager 0.32+, e.g. "first notification", "all alerts resolved"
 	Alerts              []*AlertmanagerAlertV4 `yaml:"alerts"`
 }
 
@@ -130,8 +134,10 @@ type AlertmanagerWebhookTemplateV4 struct {
 	GroupLabels         map[string]string `yaml:"groupLabels"`       // K=V map
 	CommonLabels        map[string]string `yaml:"commonLabels"`      // K=V map
 	CommonAnnotations   map[string]string `yaml:"commonAnnotations"` // K=V map
+	RouteLabels         map[string]string `yaml:"routeLabels"`       // K=V map; empty before Alertmanager 0.34
 	ExternalURL         string            `yaml:"externalURL"`
 	OriginalExternalURL string
+	NotificationReason  string                 `yaml:"notification_reason"` // empty before Alertmanager 0.32
 	Alerts              []*AlertmanagerAlertV4 `yaml:"alerts"`
 	Env                 map[string]string
 }
@@ -156,6 +162,8 @@ func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, 
 	tmpval.GroupLabels = a.GroupLabels
 	tmpval.CommonLabels = a.CommonLabels
 	tmpval.CommonAnnotations = a.CommonAnnotations
+	tmpval.RouteLabels = a.RouteLabels
+	tmpval.NotificationReason = a.NotificationReason
 	// Transmute alertmanager URL in ExternalURL
 	tmpval.ExternalURL = GlobalRoutingConfig.urlrepAlertmanager.Transmute(a.ExternalURL)
 	tmpval.OriginalExternalURL = a.ExternalURL
@@ -204,7 +212,7 @@ func (a *AlertmanagerWebhookInputV4) String() string {
 		return o
 	}
 
-	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sExternalURL: %s\nAlerts: %d count\n",
+	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sRouteLabels:\n%sNotificationReason: %s\nExternalURL: %s\nAlerts: %d count\n",
 		a.Version,
 		a.GroupKey,
 		a.TruncatedAlertCount,
@@ -213,6 +221,8 @@ func (a *AlertmanagerWebhookInputV4) String() string {
 		labelPrinter(a.GroupLabels),
 		labelPrinter(a.CommonLabels),
 		labelPrinter(a.CommonAnnotations),
+		labelPrinter(a.RouteLabels),
+		a.NotificationReason,
 		a.ExternalURL,
 		len(a.Alerts),
 	)
@@ -234,7 +244,7 @@ func (a *AlertmanagerWebhookTemplateV4) String() string {
 		return o
 	}
 
-	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sExternalURL: %s\nOriginal URL: %s\nAlerts: %d count\n",
+	out = fmt.Sprintf("Version: %s\nGroupKey: %s\nTruncatedAlertCount: %d\nStatus: %s\nReceiver: %s\nGroupLabels:\n%sCommonLabels:\n%sCommonAnnotations:\n%sRouteLabels:\n%sNotificationReason: %s\nExternalURL: %s\nOriginal URL: %s\nAlerts: %d count\n",
 		a.Version,
 		a.GroupKey,
 		a.TruncatedAlertCount,
@@ -243,6 +253,8 @@ func (a *AlertmanagerWebhookTemplateV4) String() string {
 		labelPrinter(a.GroupLabels),
 		labelPrinter(a.CommonLabels),
 		labelPrinter(a.CommonAnnotations),
+		labelPrinter(a.RouteLabels),
+		a.NotificationReason,
 		a.ExternalURL,
 		a.OriginalExternalURL,
 		len(a.Alerts),
