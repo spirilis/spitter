@@ -166,6 +166,8 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `spitter.port` | `9820` | Container listen port. |
 | `spitter.alertmanagerURL` / `spitter.prometheusURL` | `""` | External base URLs used to rewrite alert links.  Required unless `existingConfig` is set. |
 | `spitter.logLevel` | `info` | `trace`, `debug`, `info` or `warning`; `""` leaves it to the config file or spitter's default (`trace`). |
+| `spitter.maxBodyBytes` | `0` (spitter's 10 MiB) | Largest webhook body accepted; larger ones get a 413. |
+| `spitter.idleTimeout` | `""` (spitter's `10m`) | How long an idle keep-alive connection is kept; keep it above your ingress proxy's. |
 | `spitter.metricsPath` | `/metrics` | Metrics path (also used by the PodMonitor). |
 | `spitter.routers` | `[]` | Inline routers. |
 | `spitter.configInSecret` | `false` | Store the generated config in a Secret. |

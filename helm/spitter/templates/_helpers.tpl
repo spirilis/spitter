@@ -124,8 +124,15 @@ Generated spitter config file.  Leaving listen.host empty binds all interfaces, 
 */}}
 {{- define "spitter.configFile" -}}
 {{- $s := .Values.spitter }}
+{{- $listen := dict "port" ($s.port | int) }}
+{{- with $s.maxBodyBytes }}
+{{- $_ := set $listen "maxBodyBytes" (. | int64) }}
+{{- end }}
+{{- with $s.idleTimeout }}
+{{- $_ := set $listen "idleTimeout" (. | toString) }}
+{{- end }}
 {{- $cfg := dict
-  "listen" (dict "port" ($s.port | int))
+  "listen" $listen
   "alertmanagerURL" (required "spitter.alertmanagerURL is required unless spitter.existingConfig is set" $s.alertmanagerURL)
   "prometheusURL" (required "spitter.prometheusURL is required unless spitter.existingConfig is set" $s.prometheusURL)
   "metrics" (dict "path" $s.metricsPath)

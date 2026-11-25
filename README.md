@@ -18,6 +18,17 @@ A router receives a notification when at least one alert in the group satisfies 
 receives only those alerts.  `match` compares the label's value exactly; `match_re` is an unanchored regular
 expression, so `crit` also matches `critical`.
 
+Limits on the listener, both under `listen:` in the config file:
+
+- `maxBodyBytes` (default 10 MiB, `10485760`): a larger body is answered with `413`.  Alertmanager does not retry
+  that, so the notification is lost; set `max_alerts` on its `webhook_config` if your groups get that large.
+- `idleTimeout` (default `10m`, negative for none): how long an idle keep-alive connection is kept.  It should be
+  longer than the idle timeout of whatever calls spitter, so that the caller is the one to close first:
+  Alertmanager's is 5 minutes, and a proxy in front of spitter has its own.
+
+A request must send its headers within 10 seconds and arrive in full within 30.  How long spitter then takes to
+answer is not limited, since it sends to every matching router first.
+
 The endpoint has no authentication.  Keep it reachable by Alertmanager only: the Helm chart does this with a
 NetworkPolicy when `networkPolicy.enabled` is set.
 

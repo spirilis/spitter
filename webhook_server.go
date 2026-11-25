@@ -510,7 +510,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 	// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		warnf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, logExcerpt(respData))
+		warnf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, logExcerpt(respData, 512))
 		tracef("WebhookRouter.SendWebhook failed: full response from URL=%s:\n%s", r.DestURL, respData)
 		return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
 	}
@@ -544,6 +544,50 @@ var GlobalWebhookServer *WebhookServer
 type WebhookServerListen struct {
 	Hostname string `yaml:"host,omitempty"`
 	Port     int    `yaml:"port,omitempty"`
+	// Largest webhook body accepted, in bytes.  Larger ones are answered with 413.  Default 10 MiB.
+	MaxBodyBytes int64 `yaml:"maxBodyBytes,omitempty"`
+	// How long a kept-alive connection may sit between requests before spitter closes it.  Default 10m; negative for
+	// no limit.  Keep it longer than the idle timeout of whatever calls spitter, or the caller may send a webhook
+	// down a connection that is just being closed.
+	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty"`
+}
+
+const (
+	defaultMaxBodyBytes = 10 << 20
+	// A request has this long to send its headers, and this long to arrive in full
+	serverReadHeaderTimeout = 10 * time.Second
+	serverReadTimeout       = 30 * time.Second
+	// Alertmanager's own client closes its idle connections after 5 minutes, so with this it is always the caller
+	// that closes first
+	defaultIdleTimeout = 10 * time.Minute
+	// How much of a request body trace logging prints
+	traceBodyLimit = 64 << 10
+)
+
+// maxBodyBytes is the largest webhook body the handler reads
+func (w *WebhookServer) maxBodyBytes() int64 {
+	if w != nil && w.Listen != nil && w.Listen.MaxBodyBytes > 0 {
+		return w.Listen.MaxBodyBytes
+	}
+	return defaultMaxBodyBytes
+}
+
+// httpServer returns the listener's server, with its limits on how long a caller may take
+func (w *WebhookServer) httpServer() *http.Server {
+	srv := &http.Server{
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		// Always set: left at zero, net/http would reuse the 30s read timeout as the idle timeout
+		IdleTimeout: defaultIdleTimeout,
+		// No WriteTimeout: the answer is written only after every router has been sent to, 30s each at worst
+	}
+	if w.Listen != nil {
+		srv.Addr = fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
+		if w.Listen.IdleTimeout != 0 {
+			srv.IdleTimeout = w.Listen.IdleTimeout
+		}
+	}
+	return srv
 }
 
 type WebhookServerMetrics struct {
@@ -822,10 +866,10 @@ func (w *WebhookServer) Start() error {
 	// TODO: http.HandleFunc("/v4/alertmanager/routers", handleListRoutersV4) as a GET request to list all our configured routers
 
 	GlobalWebhookServer = w // so the handler functions can find us
-	listenStr := fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
-	infof("WebhookServer listening on: %s\n", listenStr)
+	srv := w.httpServer()   // serves the default mux, where the handlers above are registered
+	infof("WebhookServer listening on: %s\n", srv.Addr)
 	debugf("All URIs: %#v\n", allURIs)
-	log.Fatal(http.ListenAndServe(listenStr, nil))
+	log.Fatal(srv.ListenAndServe())
 	return nil
 }
 
@@ -914,17 +958,27 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Collect payload
-	body, err := io.ReadAll(r.Body)
+	// Collect payload, up to a limit: the whole body is held in memory, and decoding it takes a few times as much again
+	limit := GlobalWebhookServer.maxBodyBytes()
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			// Alertmanager does not retry a 4xx, so say what to do about it
+			warnf("Refusing a webhook: its body is larger than %d bytes (listen.maxBodyBytes).  Alertmanager will not retry it; raise the limit or set max_alerts on the receiver.", limit)
+			fmt.Fprintf(w, "Webhook body is larger than %d bytes\r\n", limit)
+			return
+		}
 		w.WriteHeader(http.StatusBadRequest)
 		warnf("Error reading request body [%v]", err)
 		fmt.Fprintf(w, "Error reading request body [%v]\r\n", err)
 		return
 	}
-	defer r.Body.Close()
 
-	tracef("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, body)
+	if logEnabled(logLevelTrace) {
+		tracef("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, logExcerpt(body, traceBodyLimit))
+	}
 
 	// Alertmanager sends JSON.  Decoding it as anything looser would refuse or alter text that JSON carries untouched.
 	alertwebhook := new(alerts.AlertmanagerWebhookInputV4)

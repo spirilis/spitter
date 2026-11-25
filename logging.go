@@ -59,11 +59,10 @@ func debugf(format string, args ...any) { logAt(logLevelDebug, format, args...) 
 func infof(format string, args ...any)  { logAt(logLevelInfo, format, args...) }
 func warnf(format string, args ...any)  { logAt(logLevelWarning, format, args...) }
 
-// logExcerpt keeps a warning readable when a destination answers with a long body; trace logging has the whole thing
-func logExcerpt(b []byte) string {
-	const max = 512
+// logExcerpt returns at most max bytes of b for a log line, saying so when it cut something off
+func logExcerpt(b []byte, max int) string {
 	if len(b) <= max {
 		return string(b)
 	}
-	return string(b[:max]) + "... (truncated)"
+	return fmt.Sprintf("%s... (truncated: %d of %d bytes shown)", b[:max], max, len(b))
 }

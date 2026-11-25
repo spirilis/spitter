@@ -31,6 +31,14 @@ spitter:
   # Set to "" to leave the level to the config file's logLevel, or to spitter's own default (trace).
   logLevel: info
 
+  # Largest webhook body accepted, in bytes; larger ones get a 413, which Alertmanager does not retry.  0 keeps
+  # spitter's default of 10 MiB (10485760).  Ignored with existingConfig: set listen.maxBodyBytes in your file.
+  maxBodyBytes: 0
+  # How long an idle keep-alive connection is kept, as a Go duration; "" keeps spitter's default of 10m.  It should
+  # be longer than the idle timeout of whatever calls spitter (Alertmanager: 5m; an ingress proxy has its own).
+  # Ignored with existingConfig: set listen.idleTimeout in your file.
+  idleTimeout: ""
+
   # Path serving Prometheus metrics.  With existingConfig, set this to the metrics.path in your config file.
   metricsPath: /metrics
 

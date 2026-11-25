@@ -152,7 +152,11 @@ These came up in the 2026-11 review and the owner ruled on them. Don't raise the
 - **The built-in placeholder router** (no `--config`) stays.
 - **Trace logging can hold secrets.** That is what trace is for; the chart runs at `info`.
 
-Still open: the listener has no body size limit and no timeouts (a proposal was made, not yet implemented).
+- **Listener limits** (`httpServer`, `maxBodyBytes`): 10 MiB body (413 beyond it), 10s for headers, 30s for the
+  whole request, 10m idle, and deliberately **no write timeout**, because the handler answers only after sending to
+  every router. The idle timeout is always set explicitly: left at zero, net/http would reuse the 30s read timeout,
+  which is shorter than Alertmanager's 5-minute client idle timeout and would have spitter closing connections
+  under it.
 
 ## Gotchas when changing code
 
@@ -167,7 +171,8 @@ Still open: the listener has no body size limit and no timeouts (a proposal was 
   `ca_file`) or `tls.insecureSkipVerify` for self-signed endpoints.
 - **YAML is for configuration only**, decoded strictly with `gopkg.in/yaml.v2`. The webhook payload is JSON.
   `yaml.v3` is used by tests only.
-- **Listener defaults:** `0.0.0.0:9820`, metrics at `/metrics`, `/healthz` returns `Up`. `metrics.token` exists
+- **Listener defaults:** `0.0.0.0:9820`, metrics at `/metrics`, `/healthz` returns `Up`; limits under
+  `listen.maxBodyBytes` and `listen.idleTimeout`. `metrics.token` exists
   in the config struct but is **not enforced**.
 - **`spitter_webhook_routers` is set once at startup** and does not follow reloads.
 

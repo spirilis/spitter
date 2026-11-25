@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
@@ -42,14 +44,24 @@ func (d *destination) received() []string {
 // startSpitter serves handleWebhooksV4 with the given routers, loaded the way Start loads them
 func startSpitter(t *testing.T, routers ...*WebhookRouter) *httptest.Server {
 	t.Helper()
+	return startSpitterWith(t, &WebhookServer{Routers: routers})
+}
+
+// startSpitterWith does the same for a whole server config, behind the http.Server that Start would use
+func startSpitterWith(t *testing.T, ws *WebhookServer) *httptest.Server {
+	t.Helper()
 	initRoutingConfig(t)
-	ws := &WebhookServer{Routers: routers}
 	if err := ws.ReloadRouters(); err != nil {
 		t.Fatalf("ReloadRouters: %v", err)
 	}
 	saved := GlobalWebhookServer
 	GlobalWebhookServer = ws
-	srv := httptest.NewServer(http.HandlerFunc(handleWebhooksV4))
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(handleWebhooksV4))
+	configured := ws.httpServer()
+	srv.Config.ReadHeaderTimeout = configured.ReadHeaderTimeout
+	srv.Config.ReadTimeout = configured.ReadTimeout
+	srv.Config.IdleTimeout = configured.IdleTimeout
+	srv.Start()
 	t.Cleanup(func() {
 		srv.Close()
 		GlobalWebhookServer = saved
@@ -241,5 +253,133 @@ func TestHandlerMatchesWholeAlerts(t *testing.T) {
 				t.Errorf("attempted counter rose by %v, want %d", attempted, len(tc.want))
 			}
 		})
+	}
+}
+
+func alertPayload(summary string) string {
+	payload, _ := json.Marshal(map[string]any{
+		"version": "4", "status": "firing", "commonLabels": map[string]string{"severity": "critical"}, "commonAnnotations": map[string]string{},
+		"alerts": []any{map[string]any{"status": "firing", "labels": map[string]string{}, "annotations": map[string]string{"summary": summary}}},
+	})
+	return string(payload)
+}
+
+// Nothing bounded what a caller could make spitter hold in memory
+func TestHandlerRefusesOversizedBody(t *testing.T) {
+	logs := captureLog(t, "warning")
+	dest := newDestination(t)
+	spitter := startSpitterWith(t, &WebhookServer{
+		Listen:  &WebhookServerListen{MaxBodyBytes: 4096},
+		Routers: []*WebhookRouter{criticalRouter(dest.URL, "x")},
+	})
+
+	if status := post(t, spitter, alertPayload(strings.Repeat("A", 8192))); status != http.StatusRequestEntityTooLarge {
+		t.Errorf("status for a body over the limit = %d, want 413", status)
+	}
+	if got := dest.received(); len(got) != 0 {
+		t.Errorf("destination received %d webhooks from the oversized body, want none", len(got))
+	}
+	if !strings.Contains(logs.String(), "maxBodyBytes") {
+		t.Errorf("the refusal is not reported at warning level:\n%s", logs.String())
+	}
+
+	if status := post(t, spitter, alertPayload(strings.Repeat("A", 2048))); status != http.StatusOK {
+		t.Errorf("status for a body under the limit = %d, want 200", status)
+	}
+	if got := dest.received(); len(got) != 1 {
+		t.Errorf("destination received %d webhooks, want 1", len(got))
+	}
+}
+
+func TestServerLimits(t *testing.T) {
+	tests := []struct {
+		name     string
+		listen   *WebhookServerListen
+		wantBody int64
+		wantIdle time.Duration
+	}{
+		{"defaults without a listen section", nil, 10 << 20, 10 * time.Minute},
+		{"defaults", &WebhookServerListen{Port: 9820}, 10 << 20, 10 * time.Minute},
+		{"configured", &WebhookServerListen{MaxBodyBytes: 1 << 20, IdleTimeout: time.Minute}, 1 << 20, time.Minute},
+		// net/http reads a negative idle timeout as "none", and a zero one as "use the read timeout"
+		{"idle timeout switched off", &WebhookServerListen{IdleTimeout: -1}, 10 << 20, -1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := &WebhookServer{Listen: tc.listen}
+			if got := ws.maxBodyBytes(); got != tc.wantBody {
+				t.Errorf("maxBodyBytes() = %d, want %d", got, tc.wantBody)
+			}
+			srv := ws.httpServer()
+			if srv.IdleTimeout != tc.wantIdle {
+				t.Errorf("IdleTimeout = %s, want %s", srv.IdleTimeout, tc.wantIdle)
+			}
+			if srv.ReadHeaderTimeout != 10*time.Second || srv.ReadTimeout != 30*time.Second {
+				t.Errorf("ReadHeaderTimeout = %s and ReadTimeout = %s, want 10s and 30s", srv.ReadHeaderTimeout, srv.ReadTimeout)
+			}
+			// The answer is written only after every router has been sent to, which can take minutes
+			if srv.WriteTimeout != 0 {
+				t.Errorf("WriteTimeout = %s, want none", srv.WriteTimeout)
+			}
+		})
+	}
+}
+
+// The read timeout bounds how long a request may take to arrive.  It must not cut off a webhook whose routers are slow.
+func TestSlowRouterOutlivesReadTimeout(t *testing.T) {
+	captureLog(t, "warning")
+	initRoutingConfig(t)
+	const readTimeout = 100 * time.Millisecond
+	var delivered atomic.Int32
+	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		time.Sleep(4 * readTimeout)
+		delivered.Add(1)
+	}))
+	defer slow.Close()
+
+	ws := &WebhookServer{Routers: []*WebhookRouter{criticalRouter(slow.URL, "x")}}
+	if err := ws.ReloadRouters(); err != nil {
+		t.Fatal(err)
+	}
+	saved := GlobalWebhookServer
+	GlobalWebhookServer = ws
+	t.Cleanup(func() { GlobalWebhookServer = saved })
+	spitter := httptest.NewUnstartedServer(http.HandlerFunc(handleWebhooksV4))
+	spitter.Config.ReadTimeout = readTimeout
+	spitter.Config.ReadHeaderTimeout = readTimeout
+	spitter.Start()
+	defer spitter.Close()
+
+	// Twice over one connection: the first answer must arrive, and the connection must still be usable
+	client := spitter.Client()
+	for attempt := 1; attempt <= 2; attempt++ {
+		resp, err := client.Post(spitter.URL, "application/json", strings.NewReader(alertPayload("s")))
+		if err != nil {
+			t.Fatalf("attempt %d: %v", attempt, err)
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("attempt %d: status = %d, want 200", attempt, resp.StatusCode)
+		}
+	}
+	if got := delivered.Load(); got != 2 {
+		t.Errorf("slow destination received %d webhooks, want 2", got)
+	}
+}
+
+// Even at trace, one large request must not become an equally large log line
+func TestTraceLogCapsTheBody(t *testing.T) {
+	logs := captureLog(t, "trace")
+	dest := newDestination(t)
+	spitter := startSpitter(t, criticalRouter(dest.URL, "x"))
+	if status := post(t, spitter, alertPayload(strings.Repeat("A", 512<<10))); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if got := len(logs.String()); got > 128<<10 {
+		t.Errorf("a 512 kB request produced %d bytes of log, want the body capped at 64 kB", got)
+	}
+	if !strings.Contains(logs.String(), "truncated") {
+		t.Errorf("the log does not say the body was truncated")
 	}
 }

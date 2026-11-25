@@ -1,6 +1,12 @@
 listen:
   host: "0.0.0.0"
   port: 9820
+  # Largest webhook body accepted, in bytes (default 10 MiB).  A larger one is answered with 413, which Alertmanager
+  # does not retry: set max_alerts on its webhook_config if your alert groups get that large.
+  # maxBodyBytes: 10485760
+  # How long an idle keep-alive connection is kept (default 10m; negative for no limit).  Keep it longer than the
+  # idle timeout of whatever calls spitter: Alertmanager's is 5 minutes.
+  # idleTimeout: 10m
 alertmanagerURL: http://alertmanager
 prometheusURL: http://prometheus
 # Every file in this directory is read as one more router document
