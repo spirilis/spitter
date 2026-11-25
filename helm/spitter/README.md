@@ -92,8 +92,9 @@ release's namespace.
 ## Network policy
 
 spitter's webhook endpoint has no authentication: anyone who can reach it can have alerts sent to your routers'
-destinations.  By default the chart therefore creates a NetworkPolicy that only lets Alertmanager (to post webhooks)
-and Prometheus (to scrape metrics) connect to the spitter pods:
+destinations.  Set `networkPolicy.enabled: true` to have the chart create a NetworkPolicy that only lets
+Alertmanager (to post webhooks) and Prometheus (to scrape metrics) connect to the spitter pods.  It is off by
+default.  These are its defaults once enabled:
 
 ```yaml
 networkPolicy:
@@ -111,10 +112,11 @@ networkPolicy:
 
 Those are the labels prometheus-operator (kube-prometheus-stack) puts on its pods.  **If your Alertmanager's pods
 are labelled differently, the policy blocks its webhooks**: check with
-`kubectl get pods -A -l app.kubernetes.io/name=alertmanager`, and replace `networkPolicy.from` to match yours, or
-set `networkPolicy.enabled: false`.
+`kubectl get pods -A -l app.kubernetes.io/name=alertmanager` before enabling it, and replace `networkPolicy.from`
+to match yours.  The default admits a pod with that label in any namespace; put your monitoring namespace in
+`namespaceSelector` (`matchLabels: {kubernetes.io/metadata.name: monitoring}`) to narrow it.
 
-The policy can only be created when the callers can be named.  Once spitter is exposed outside the cluster
+An enabled policy can only be created when the callers can be named.  Once spitter is exposed outside the cluster
 (Ingress, HTTPRoute, NodePort or LoadBalancer), the traffic arrives from your ingress controller, gateway or an
 outside address, which the chart cannot know.  It then creates no policy, and says so in the release notes, unless
 `networkPolicy.extraFrom` names those callers:
@@ -179,7 +181,7 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `service.extraPorts` | `[]` | Additional ServicePorts, e.g. for sidecars. |
 | `ingress.*` | disabled | `networking.k8s.io/v1` Ingress. |
 | `httpRoute.*` | disabled | Gateway API HTTPRoute. |
-| `networkPolicy.enabled` | `true` | NetworkPolicy admitting only the peers below; skipped when spitter is exposed externally and `extraFrom` is empty. |
+| `networkPolicy.enabled` | `false` | NetworkPolicy admitting only the peers below; skipped when spitter is exposed externally and `extraFrom` is empty. |
 | `networkPolicy.from` | Alertmanager and Prometheus pods in any namespace | Peers allowed to reach spitter's port. |
 | `networkPolicy.extraFrom` / `networkPolicy.extraIngress` | `[]` | More peers for spitter's port / more ingress rules. |
 | `metrics.podMonitor.*` | disabled | prometheus-operator PodMonitor (`labels`, `interval`, `relabelings`, ...). |

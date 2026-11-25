@@ -9,3 +9,5 @@ spitter:
       matchers:
         - label: severity
           match_re: ".*"
+networkPolicy:
+  enabled: true

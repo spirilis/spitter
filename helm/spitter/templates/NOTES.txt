@@ -56,12 +56,16 @@ NetworkPolicy {{ $fullName }} only lets these reach spitter on port {{ .Values.s
 {{- range (concat .Values.networkPolicy.from .Values.networkPolicy.extraFrom) }}
   - {{ toJson . }}
 {{- end }}
-If your Alertmanager is not among them its webhooks will be dropped; adjust networkPolicy.from, or set
-networkPolicy.enabled=false.  List what the selectors match with:
+If your Alertmanager is not among them its webhooks will be dropped; adjust networkPolicy.from.  List what the
+selectors match with:
   kubectl get pods -A -l app.kubernetes.io/name=alertmanager
 {{- else if .Values.networkPolicy.enabled }}
 
 No NetworkPolicy was created: spitter is exposed outside the cluster and networkPolicy.extraFrom does not say who
 delivers that traffic (your ingress controller's or gateway's pods, or an address range).  The webhook endpoint has
 no authentication, so anyone who can reach it can send alerts through your routers.
+{{- else }}
+
+The webhook endpoint has no authentication.  networkPolicy.enabled=true limits who can reach it to Alertmanager and
+Prometheus pods; check the selectors in networkPolicy.from against your pods first.
 {{- end }}

@@ -19,7 +19,7 @@ receives only those alerts.  `match` compares the label's value exactly; `match_
 expression, so `crit` also matches `critical`.
 
 The endpoint has no authentication.  Keep it reachable by Alertmanager only: the Helm chart does this with a
-NetworkPolicy.
+NetworkPolicy when `networkPolicy.enabled` is set.
 
 ## Template data
 

@@ -144,7 +144,7 @@ than breaking anything. To expose one:
 These came up in the 2026-11 review and the owner ruled on them. Don't raise them again as findings:
 
 - **The webhook endpoint has no authentication.** It is meant to be reachable by Alertmanager only; the chart's
-  NetworkPolicy enforces that where it can.
+  opt-in NetworkPolicy enforces that where it can.
 - **200 is answered even when sends fail.** Only an unusable payload (not JSON, wrong version) gets a 400.
 - **Redirects are followed**, including a 301/302 that turns the POST into a GET.
 - **Router documents are fully trusted**: templates can read the environment (`.Env`, sprig's `env`) and
@@ -180,7 +180,8 @@ Still open: the listener has no body size limit and no timeouts (a proposal was 
   you bring your own config file.
 - `spitter.logLevel` (default `info`) is passed as the `SPITTER_LOG_LEVEL` environment variable, not a flag, so an
   older image still starts.
-- `networkPolicy` (on by default) admits only Alertmanager and Prometheus pods, selected by prometheus-operator's
+- `networkPolicy` (**off by default**, the owner's ruling: a selector that misses Alertmanager silently stops every
+  alert) admits only Alertmanager and Prometheus pods, selected by prometheus-operator's
   `app.kubernetes.io/name` labels in any namespace. It is rendered only when the callers can be named: in-cluster
   exposure, or `networkPolicy.extraFrom` set when an Ingress, HTTPRoute, NodePort or LoadBalancer is used
   (`spitter.networkPolicy` helper). It is ingress-only; never add an egress rule, which would cut off the

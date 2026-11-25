@@ -27,6 +27,7 @@ metrics:
       release: kube-prometheus-stack
 # spitter is exposed through the gateway, so the NetworkPolicy is only created because the gateway's pods are named
 networkPolicy:
+  enabled: true
   extraFrom:
     - namespaceSelector:
         matchLabels:
