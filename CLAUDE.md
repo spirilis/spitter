@@ -14,6 +14,7 @@ Module `github.com/spirilis/spitter`, Go 1.26 (`go.mod`); the Dockerfile builds 
 go test ./...                      # all tests; no network, no external services needed
 go vet ./...
 go build -o spitter .              # /spitter is gitignored
+go test -race ./...                # the reload test only proves anything under the race detector
 helm lint helm/spitter -f helm/spitter/ci/<x>-values.yaml   # clusterip, gateway, nodeport-ingress
 docker buildx build --platform linux/amd64,linux/arm64 -t spirilis/spitter:<ver> .
 ```
@@ -21,7 +22,7 @@ docker buildx build --platform linux/amd64,linux/arm64 -t spirilis/spitter:<ver>
 The binary has two kong subcommands (`main.go`):
 
 - `spitter router` (the image's default CMD) runs the router. It takes `--config`, `--alertmanager`,
-  `--prometheus`, `--routers`, `--routers-watch-interval` and `--reload-trigger`, each with a `SPITTER_*`
+  `--prometheus`, `--routers`, `--routers-watch-interval`, `--reload-trigger` and `--log-level`, each with a `SPITTER_*`
   environment variable. A flag or variable overrides the config file. With no `--config` at all, a built-in
   placeholder config is used, which is only useful for smoke testing.
 - `spitter dump [--listen] [--port]` (`dump/`) runs a tiny server that prints every request to stdout. Point a
@@ -31,35 +32,41 @@ The binary has two kong subcommands (`main.go`):
 
 | Path | What it holds |
 | --- | --- |
-| `main.go` | CLI parsing, config file load (YAML), CLI overrides, then `WebhookServer.Start()`. Also the `DEBUGLEVEL_*` constants (all `true`, so trace logging is always on). |
+| `main.go` | CLI parsing, config file load (`loadConfigFile`, strict YAML), CLI overrides, then `WebhookServer.Start()`. |
+| `logging.go` | Log levels (`tracef`, `debugf`, `infof`, `warnf`, `setLogLevel`). |
 | `webhook_server.go` | Almost all the logic: `WebhookRouter` (+ `WebhookAuthentication`, `WebhookTLS`), `WebhookMatcher`, `WebhookServer` (config, reload, watchers, metrics, HTTP handlers). |
 | `alerts/alertmanager.go` | Alertmanager v4 payload types, `Prepare()` → template data, and `URLReplacements` (link rewriting). Holds `GlobalRoutingConfig`. |
 | `dump/` | The `dump` subcommand. |
 | `examples/webhook_server.yml` | Reference config showing every router option. `examples/*_local.yml` is gitignored for personal configs. |
 | `helm/spitter/` | Helm chart (see below). |
 | `PROMETHEUS-METRICS.md` | Metric list. The `WebhookServer` section is implemented; the per-alert/per-label section is still only a proposal. |
-| `*_test.go` | Routing/filtering, matcher validation, send status handling, auth/TLS, router-dir checksum (`router_watch_test.go`), templates and URL rewriting (`alerts/templates_test.go`). |
+| `*_test.go` | The handler end to end (`webhook_handler_test.go`), router validation, loading and reload (`router_load_test.go`), the documented examples (`examples_test.go`), log levels (`logging_test.go`), routing/filtering, send status handling, auth/TLS, router-dir checksum (`router_watch_test.go`), payload fields, templates and URL rewriting (`alerts/`). |
 
 ## Request flow
 
-1. `handleWebhooksV4` accepts POST only. It decodes the body with the **YAML** decoder (JSON is valid YAML) into
-   `alerts.AlertmanagerWebhookInputV4`.
-2. For each router from `GlobalWebhookServer.GetRouters()`, the router is a candidate only when **every** matcher
-   matches something: `CommonLabels` or any alert's labels (`HasMatchingAlerts`).
+1. `handleWebhooksV4` accepts POST only and decodes the body with `encoding/json` into
+   `alerts.AlertmanagerWebhookInputV4`. A body that is not JSON, or whose version is not `"4"`, gets a 400, which is
+   final for Alertmanager. Null entries in `alerts` are dropped.
+2. Each router from `GlobalWebhookServer.GetRouters()` goes through `routeWebhook`, behind a `recover` so that one
+   router cannot stop the ones after it. A router is a candidate only when **every** matcher matches something:
+   `CommonLabels` or any alert's labels (`HasMatchingAlerts`).
 3. `PrepareTemplateData` calls `Prepare()`, which:
    - rejects anything but version `"4"`;
-   - copies common labels and annotations into each alert;
+   - gives each alert **new** label and annotation maps with the common ones laid over its own (the payload itself
+     is never written to: it is prepared once per matching router);
    - rewrites `ExternalURL` and `GeneratorURL` onto the configured bases (the originals stay in
      `OriginalExternalURL` and `OriginalGeneratorURL`);
    - exposes the process environment as `.Env`.
 
    If the common labels don't satisfy every matcher, alerts that don't individually satisfy all of them are
-   **dropped** from `.Alerts` (`IsMatchingAlert`).
-4. `SendWebhook` renders the template and sends it with the router's method (default `POST`) and content type
-   (default `application/yaml`). It adds the `Authorization` header (bearer token, token file or basic auth) and any
-   cookies, and uses a per-router `http.Client` (30s timeout, TLS settings). Only a 2xx response counts as success.
-5. Routers run **sequentially**, and the handler always answers 200 to Alertmanager. Send errors are only logged
-   and reflected in the metrics.
+   **dropped** from `.Alerts` (`IsMatchingAlert`), and `.Status` is recomputed for what is left (`statusOf`). If
+   nothing is left, the router sends nothing.
+4. `SendWebhook` executes the router's parsed template and sends it with the router's method (default `POST`) and
+   content type (default `application/yaml`). It adds the `Authorization` header (bearer token, token file or basic
+   auth) and any cookies, and uses the router's `http.Client` (30s timeout, TLS settings). A `tokenFile` is read for
+   every send. Only a 2xx response counts as success.
+5. Routers run **sequentially**, and once the payload is accepted the handler answers 200 to Alertmanager. Send
+   errors are only logged (as warnings) and reflected in the metrics.
 
 Template data is `alerts.AlertmanagerWebhookTemplateV4` (field table in README "Template data"). It has
 `.Status`, `.Receiver`, `.GroupLabels`, `.CommonLabels`, `.CommonAnnotations`, `.RouteLabels`,
@@ -67,23 +74,33 @@ Template data is `alerts.AlertmanagerWebhookTemplateV4` (field table in README "
 `.Status`, `.Labels`, `.Annotations`, `.StartsAt`, `.EndsAt`, `.GeneratorURL`, `.OriginalGeneratorURL` and
 `.Fingerprint`.
 
+What `toJson` prints is part of the template interface (`TestToJsonOfTemplateData`): `.Env` is left out of
+`{{ . | toJson }}`, and alerts print with their Go field names because `AlertmanagerAlertV4` deliberately has no
+`json` tags. Examples must build JSON with `toJson`, never by quoting values; `examples_test.go` renders them
+against hostile alert text.
+
 ### Matchers
 
 `{label, match}` is an exact match and `{label, match_re}` is a Go regexp. A regexp is unanchored, so `"crit"`
-matches `"critical"`. If both are set, either one may match. The regexp is compiled in `Check()`, so a bad
-`match_re` rejects the router at load time.
+matches `"critical"`. If both are set, either one may match.
 
 ### Router loading and reload
 
-`ReloadRouters()` builds the router list from two sources:
+`ReloadRouters()` builds a **new** router list from two sources:
 
-- the inline `routers:` in the config file;
-- every file in `addlRouterDir`, one router document per file (YAML or JSON).
+- the inline `routers:` in the config file, copied with `clone()` on every reload;
+- every file in `addlRouterDir`, one router document per file (YAML or JSON), decoded strictly.
 
-Each router goes through `Check()` (URL, template and ≥1 matcher; compiles the regexps) and then `prepare()`
-(defaults, token file, HTTP client). Invalid routers are counted in `spitter_webhook_routers_rejected` and skipped.
-Files that don't parse are skipped silently and are not counted. If no valid routers remain, reload returns an
-error.
+Each router goes through `Check()` and then `prepare()`:
+
+- `Check()` validates the URL, method, matchers and auth settings, and parses the template and regexps. The full
+  list of rejections is in README "Router validation".
+- `prepare()` applies defaults, checks the token file is readable and builds the HTTP client.
+
+A loaded router is never changed again, which is what makes it safe to use from requests without locking. Rejected
+routers, including files that cannot be read or parsed, are logged as warnings and counted in
+`spitter_webhook_routers_rejected`. If no valid routers remain, reload returns an error. Reloads are serialized by
+`reloadMutex`.
 
 Reload is triggered by:
 
@@ -95,6 +112,17 @@ Reload is triggered by:
 **A reload that ends with zero valid routers panics the process on purpose**, so Kubernetes crash-loops it and
 someone notices.
 
+### Logging
+
+`--log-level` / `SPITTER_LOG_LEVEL` / `logLevel:` selects `trace` (the binary's default), `debug`, `info` or
+`warning`. The rule for new log lines:
+
+- anything that loses or may lose an alert is a `warnf`, with the error in it;
+- request headers, payloads, rendered templates, destination responses and template data (which holds the
+  environment) are `tracef` only.
+
+The `alerts` package and `dump` still log through `log` directly.
+
 ### Tracking upstream's payload
 
 The v4 payload is defined in Alertmanager's `notify/webhook/webhook.go` (`Message`) and `template/template.go`
@@ -104,31 +132,44 @@ The v4 payload is defined in Alertmanager's `notify/webhook/webhook.go` (`Messag
 - `routeLabels` was added in 0.34, already rendered by the dispatcher.
 
 Decoding ignores fields spitter doesn't know, so a new upstream field is silently missing from templates rather
-than breaking anything. To expose one, add it to both `AlertmanagerWebhookInputV4` and
-`AlertmanagerWebhookTemplateV4`, copy it in `Prepare()`, and extend `alerts/webhook_fields_test.go`.
+than breaking anything. To expose one:
+
+1. Add it to `AlertmanagerWebhookInputV4` with `json` and `yaml` tags. Without the `json` tag a key that differs
+   from the field name decodes to zero without any error.
+2. Add it to `AlertmanagerWebhookTemplateV4` and copy it in `Prepare()`.
+3. Extend `TestPayloadDecodesEveryField` and the tests next to it in `alerts/webhook_fields_test.go`.
+
+## Decisions already made
+
+These came up in the 2026-11 review and the owner ruled on them. Don't raise them again as findings:
+
+- **The webhook endpoint has no authentication.** It is meant to be reachable by Alertmanager only; the chart's
+  NetworkPolicy enforces that where it can.
+- **200 is answered even when sends fail.** Only an unusable payload (not JSON, wrong version) gets a 400.
+- **Redirects are followed**, including a 301/302 that turns the POST into a GET.
+- **Router documents are fully trusted**: templates can read the environment (`.Env`, sprig's `env`) and
+  `tokenFile` can name any readable file.
+- **The built-in placeholder router** (no `--config`) stays.
+- **Trace logging can hold secrets.** That is what trace is for; the chart runs at `info`.
+
+Still open: the listener has no body size limit and no timeouts (a proposal was made, not yet implemented).
 
 ## Gotchas when changing code
 
-- **Global state.** `GlobalWebhookServer`, `alerts.GlobalRoutingConfig`, the router mutex, and the Prometheus
-  metrics are package globals. `Start()` registers the metrics with the default registry, so it can only run once
-  per process. Tests call `Check()`/`prepare()`/`SendWebhook()` directly and stub
-  `webhookreqSuccessfulCounter` in `TestMain` (`webhook_send_test.go`). Do the same rather than calling `Start()`.
-- **Templates are only parsed at send time.** `SendWebhook` uses `template.Must` on every call, so a
-  syntactically bad template passes `Check()` and panics inside the handler (net/http recovers it, and the
-  remaining routers for that request are skipped).
-- **Inline routers are re-prepared on every reload while requests may be using them**, which is why `client` is
-  an `atomic.Pointer`. Keep that in mind before adding more mutable router state.
-- **`Prepare()` writes common labels/annotations into the incoming alert's own maps** using `maps.Copy`, with no
-  nil check on the destination.
-- **The `alerts` package logs via `log`; `main` gates its logging on the `DEBUGLEVEL_*` constants.** There is no
-  runtime log-level control (it's a TODO). Trace logging dumps full payloads and rendered templates.
-- **HTTPS is verified by default** (a change since earlier versions). Routers need `tls.caFile` (which replaces the
-  system roots, like Prometheus' `ca_file`) or `tls.insecureSkipVerify` for self-signed endpoints. An unreadable
-  `caFile` or `tokenFile` rejects the router.
-- **Two YAML libraries are in `go.mod`:** `gopkg.in/yaml.v2` is used for the config file and payload decoding.
-  Struct tags are `yaml:"..."`.
+- **Global state.** `GlobalWebhookServer`, `alerts.GlobalRoutingConfig`, the router mutex, the log level and the
+  Prometheus metrics are package globals. `Start()` registers the metrics with the default registry, so it can only
+  run once per process. Tests stub the metrics in `TestMain` (`webhook_send_test.go`) and serve `handleWebhooksV4`
+  through `startSpitter` (`webhook_handler_test.go`). Do the same rather than calling `Start()`.
+- **Routers are immutable once loaded.** Don't add state that changes after `prepare()`; put per-send work in
+  `SendWebhook`, as the token file read is.
+- **Tests that check log output use `captureLog(t, level)`**, which also restores the level afterwards.
+- **HTTPS is verified by default.** Routers need `tls.caFile` (which replaces the system roots, like Prometheus'
+  `ca_file`) or `tls.insecureSkipVerify` for self-signed endpoints.
+- **YAML is for configuration only**, decoded strictly with `gopkg.in/yaml.v2`. The webhook payload is JSON.
+  `yaml.v3` is used by tests only.
 - **Listener defaults:** `0.0.0.0:9820`, metrics at `/metrics`, `/healthz` returns `Up`. `metrics.token` exists
   in the config struct but is **not enforced**.
+- **`spitter_webhook_routers` is set once at startup** and does not follow reloads.
 
 ## Helm chart (`helm/spitter`)
 
@@ -137,10 +178,17 @@ than breaking anything. To expose one, add it to both `AlertmanagerWebhookInputV
 - `spitter.routers` in values is rendered into a generated config, and pods roll when it changes. Routers can also
   be mounted from a ConfigMap/Secret directory and hot-reloaded through the watch interval. `existingConfig` lets
   you bring your own config file.
+- `spitter.logLevel` (default `info`) is passed as the `SPITTER_LOG_LEVEL` environment variable, not a flag, so an
+  older image still starts.
+- `networkPolicy` (on by default) admits only Alertmanager and Prometheus pods, selected by prometheus-operator's
+  `app.kubernetes.io/name` labels in any namespace. It is rendered only when the callers can be named: in-cluster
+  exposure, or `networkPolicy.extraFrom` set when an Ingress, HTTPRoute, NodePort or LoadBalancer is used
+  (`spitter.networkPolicy` helper). It is ingress-only; never add an egress rule, which would cut off the
+  destinations.
 - `values.schema.json` validates values; update it alongside `values.yaml`.
 - `ci/*-values.yaml` are lint/test value sets.
 - When the app or chart changes, bump `Chart.yaml` `version` (and `appVersion` for app changes). Currently
-  version `0.2.2` / appVersion `0.2.1`.
+  version `0.2.3` / appVersion `0.2.2`.
 
 ## Container
 
