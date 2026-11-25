@@ -8,7 +8,7 @@ spitter:
       auth:
         token: not-a-real-token
       template: |-
-        {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+        {"status": {{ .Status | toJson }}, "alerts": {{ len .Alerts }}}
       matchers:
         - label: severity
           match: critical

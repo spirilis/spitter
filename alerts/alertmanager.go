@@ -147,7 +147,9 @@ type AlertmanagerWebhookTemplateV4 struct {
 	OriginalExternalURL string
 	NotificationReason  string                 `yaml:"notification_reason"` // empty before Alertmanager 0.32
 	Alerts              []*AlertmanagerAlertV4 `yaml:"alerts"`
-	Env                 map[string]string
+	// Templates read the environment as .Env.NAME.  It stays out of {{ . | toJson }}, which would otherwise send
+	// every variable, secrets included, to the destination.
+	Env map[string]string `json:"-"`
 }
 
 // Prepare is the operative function to take an accepted Alertmanager webhook request and "format" it to execute

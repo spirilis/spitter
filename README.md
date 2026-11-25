@@ -26,6 +26,18 @@ Each alert has `.Status`, `.Labels` and `.Annotations` (with the common ones mer
 (RFC3339 strings; use sprig's `toDate` to format them), `.GeneratorURL` / `.OriginalGeneratorURL` (rewritten onto
 the configured Prometheus URL / as sent) and `.Fingerprint`.
 
+### Building JSON
+
+Write values into a JSON payload with sprig's `toJson`, which adds the quotes and escaping and also takes whole maps:
+
+```
+{"status": {{ .Status | toJson }}, "summary": {{ .CommonAnnotations.summary | toJson }}, "labels": {{ .CommonLabels | toJson }}}
+```
+
+Do not put a value between quotes yourself (`"{{ .CommonAnnotations.summary }}"`).  One quote or newline in the text
+breaks the payload, and whoever writes the alert's text can then add fields of their own.  `{{ . | toJson }}` prints
+the whole payload; `.Env` is left out of it.
+
 ## Router authentication and TLS
 
 Each router can authenticate to its destination and choose how the destination's certificate is checked:

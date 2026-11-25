@@ -24,7 +24,7 @@ spitter:
     - url: https://chat.example.com/hooks/alerts
       contentType: application/json
       template: |-
-        {"text": "[{{ .Status }}] {{ range .Alerts }}{{ .Labels.alertname }} {{ end }}"}
+        {"text": {{ printf "[%s] %d alert(s): %s" .Status (len .Alerts) .CommonLabels.alertname | toJson }}}
       matchers:
         - label: severity
           match_re: "critical|warning"

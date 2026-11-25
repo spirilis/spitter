@@ -35,7 +35,7 @@ spitter:
   #   method: POST
   #   contentType: application/json
   #   template: |-
-  #     {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+  #     {"status": {{ .Status | toJson }}, "alerts": {{ len .Alerts }}}
   #   matchers:
   #     - label: severity
   #       match_re: "critical|warning"
