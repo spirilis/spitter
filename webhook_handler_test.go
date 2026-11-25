@@ -350,7 +350,7 @@ func TestSlowRouterOutlivesReadTimeout(t *testing.T) {
 	spitter.Start()
 	defer spitter.Close()
 
-	// Twice over one connection: the first answer must arrive, and the connection must still be usable
+	// Twice, so that a server left in a bad state by the first request would show
 	client := spitter.Client()
 	for attempt := 1; attempt <= 2; attempt++ {
 		resp, err := client.Post(spitter.URL, "application/json", strings.NewReader(alertPayload("s")))

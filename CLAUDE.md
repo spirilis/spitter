@@ -164,6 +164,9 @@ These came up in the 2026-11 review and the owner ruled on them. Don't raise the
   Prometheus metrics are package globals. `Start()` registers the metrics with the default registry, so it can only
   run once per process. Tests stub the metrics in `TestMain` (`webhook_send_test.go`) and serve `handleWebhooksV4`
   through `startSpitter` (`webhook_handler_test.go`). Do the same rather than calling `Start()`.
+- **Don't tie outbound sends to `r.Context()`.** net/http cancels the request's context when the 30s read timeout
+  passes while the handler is still sending to routers, which is normal with a slow destination
+  (`TestSlowRouterOutlivesReadTimeout`).
 - **Routers are immutable once loaded.** Don't add state that changes after `prepare()`; put per-send work in
   `SendWebhook`, as the token file read is.
 - **Tests that check log output use `captureLog(t, level)`**, which also restores the level afterwards.
