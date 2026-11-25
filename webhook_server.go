@@ -64,7 +64,6 @@ func (r *WebhookRouter) Check() error {
 		}
 		// Compile match_re now so a bad expression rejects the router at load time instead of failing on every alert
 		if err := m.compile(); err != nil {
-			log.Printf("Rejecting router for URL [%s]: label matcher [%s] has an invalid match_re: %v", r.DestURL, m, err)
 			return fmt.Errorf("label matcher [%s] has an invalid match_re: %v", m, err)
 		}
 	}
@@ -94,9 +93,7 @@ func (wa *WebhookAuthentication) ResolveBearerToken() error {
 	if wa.BearerTokenFromFile != "" {
 		contents, err := os.ReadFile(wa.BearerTokenFromFile)
 		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookAuthentication.ResolveBearerToken experienced error [%v] reading bearer token file %s", err, wa.BearerTokenFromFile)
-			}
+			debugf("WebhookAuthentication.ResolveBearerToken experienced error [%v] reading bearer token file %s", err, wa.BearerTokenFromFile)
 			return err
 		}
 		// Token files usually end in a newline, which is not valid in a header value
@@ -164,8 +161,8 @@ func (r *WebhookRouter) prepare() error {
 		return err
 	}
 	r.client.Store(client)
-	if r.TLS != nil && r.TLS.InsecureSkipVerify && DEBUGLEVEL_WARNING {
-		log.Printf("Router [URL=\"%s\"] does not verify its destination's TLS certificate (tls.insecureSkipVerify)", r.DestURL)
+	if r.TLS != nil && r.TLS.InsecureSkipVerify {
+		warnf("Router [URL=\"%s\"] does not verify its destination's TLS certificate (tls.insecureSkipVerify)", r.DestURL)
 	}
 	return nil
 }
@@ -255,7 +252,7 @@ func (m *WebhookMatcher) doesRegexpMatch(re string) bool {
 	}
 	// Normally a no-op since Check() already compiled it; covers matchers that never went through Check()
 	if err := m.compile(); err != nil {
-		log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
+		warnf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
 		return false
 	}
 
@@ -274,11 +271,11 @@ func matcherListContains(sl []*WebhookMatcher, m *WebhookMatcher) bool {
 // IsMatchingAlert reports whether every one of the router's matchers is satisfied, either by the CommonLabels (matchedCommon) or by the alert's own labels
 func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommon []*WebhookMatcher) bool {
 	if r == nil {
-		log.Println("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
+		warnf("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
 		return false
 	}
 	if l == nil {
-		log.Println("WebhookRouter.IsMatchingAlert error - called with nil Alert")
+		warnf("WebhookRouter.IsMatchingAlert error - called with nil Alert")
 		return false
 	}
 
@@ -355,8 +352,8 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 	tp := template.Must(template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template))
 	if err := tp.Execute(b, a); err == nil {
-		if DEBUGLEVEL_TRACE {
-			log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
+		if logEnabled(logLevelTrace) {
+			tracef("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
 		}
 		client := r.client.Load()
 		if client == nil {
@@ -364,9 +361,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		}
 		req, err := http.NewRequest(r.HttpMethod, r.DestURL, b)
 		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook error - cannot create an HTTP Request object for reason [%v]", err)
-			}
+			warnf("WebhookRouter.SendWebhook error - cannot create an HTTP Request object for reason [%v]", err)
 			return fmt.Errorf("WebhookRouter.SendWebhook http.NewRequest error %v", err)
 		}
 
@@ -387,9 +382,7 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		// Submit HTTP/HTTPS request
 		resp, err := client.Do(req)
 		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
-			}
+			warnf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
 			return fmt.Errorf("WebhookRouter.SendWebhook error submitting HTTP request: %w", err)
 		}
 		defer func() {
@@ -405,9 +398,8 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 
 		// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
 		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, respData)
-			}
+			warnf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, logExcerpt(respData))
+			tracef("WebhookRouter.SendWebhook failed: full response from URL=%s:\n%s", r.DestURL, respData)
 			return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
 		}
 
@@ -416,13 +408,10 @@ func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) err
 		webhookreqSuccessfulCounter.Inc()
 		webhookreqSuccessfulMutex.Unlock()
 
-		if DEBUGLEVEL_TRACE {
-			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
-		}
+		tracef("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
 	} else {
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("WebhookRouter.SendWebhook failed to execute template for reason [%v] on data [%#v]", err, a)
-		}
+		warnf("WebhookRouter.SendWebhook failed to execute template for URL=%s: %v", r.DestURL, err)
+		tracef("WebhookRouter.SendWebhook template data was [%#v]", a)
 		return fmt.Errorf("WebhookRouter.SendWebhook template Execute error %v", err)
 	}
 	return nil
@@ -439,6 +428,7 @@ type WebhookServer struct {
 	AdditionalRouterWatch     time.Duration         `yaml:"addlRouterDirWatchInterval,omitempty"`
 	ReloadTriggerFile         string                `yaml:"reloadTriggerFile,omitempty"`
 	Metrics                   *WebhookServerMetrics `yaml:"metrics,omitempty"`
+	LogLevel                  string                `yaml:"logLevel,omitempty"`
 	allRouters                []*WebhookRouter
 }
 
@@ -465,26 +455,21 @@ func (w *WebhookServer) ReloadRouters() error {
 	var tmpAllRouters []*WebhookRouter
 	tmpRoutersRejected := 0
 	for _, rt := range w.Routers {
-		if rt.Check() != nil {
+		if err := rt.Check(); err != nil {
 			tmpRoutersRejected++
+			warnf("Rejecting router [URL=\"%s\"]: %v", rt.DestURL, err)
 			continue
 		}
 		if err := rt.prepare(); err != nil {
 			tmpRoutersRejected++
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("Rejecting router [URL=\"%s\"]: %v", rt.DestURL, err)
-			}
+			warnf("Rejecting router [URL=\"%s\"]: %v", rt.DestURL, err)
 			continue
 		}
 		tmpAllRouters = append(tmpAllRouters, rt)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
-		}
+		debugf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
 	}
 	if w.AdditionalRouterDirectory != "" {
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Inspecting AdditionalRouterDirectory [%s] for more routers", w.AdditionalRouterDirectory)
-		}
+		debugf("Inspecting AdditionalRouterDirectory [%s] for more routers", w.AdditionalRouterDirectory)
 		// Read every file in this directory and attempt to unmarshal it into a WebhookRouter object; if it fails, ignore and just keep going
 		files, err := os.ReadDir(w.AdditionalRouterDirectory)
 		if err == nil {
@@ -503,42 +488,28 @@ func (w *WebhookServer) ReloadRouters() error {
 								// Check doesn't verify HTTP Method since prepare assumes POST as a default.
 								if err := rt.prepare(); err != nil {
 									tmpRoutersRejected++
-									if DEBUGLEVEL_DEBUG {
-										log.Printf("Rejecting router [URL=\"%s\"] from [%s]: %v", rt.DestURL, file.Name(), err)
-									}
+									warnf("Rejecting router [URL=\"%s\"] from [%s]: %v", rt.DestURL, file.Name(), err)
 								} else {
 									tmpAllRouters = append(tmpAllRouters, rt)
-									if DEBUGLEVEL_DEBUG {
-										log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
-									}
+									debugf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
 
 								}
 							} else {
 								tmpRoutersRejected++
-								if DEBUGLEVEL_DEBUG {
-									log.Printf("Read WebhookRouter object but it failed its Check(): [%s]", file.Name())
-								}
+								warnf("Read WebhookRouter object but it failed its Check(): [%s]", file.Name())
 							}
 						} else {
-							if DEBUGLEVEL_DEBUG {
-								log.Printf("Read file but could not unmarshal as WebhookRouter object: [%s]", file.Name())
-							}
+							warnf("Read file but could not unmarshal as WebhookRouter object: [%s]", file.Name())
 						}
 					} else {
-						if DEBUGLEVEL_TRACE {
-							log.Printf("Error reading file [%s]: %v", file.Name(), err)
-						}
+						tracef("Error reading file [%s]: %v", file.Name(), err)
 					}
 				} else {
-					if DEBUGLEVEL_TRACE {
-						log.Printf("Directory entry is a directory: %s", file.Name())
-					}
+					tracef("Directory entry is a directory: %s", file.Name())
 				}
 			}
 		} else {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookServer.Start had an error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
-			}
+			warnf("WebhookServer.Start had an error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
 		}
 	}
 
@@ -594,18 +565,14 @@ func (w *WebhookServer) Start() error {
 		Help: "This is the number of webhook router configs defined in the running spitter instance",
 	})
 	c.Set(float64(len(w.allRouters)))
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_routers", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_routers", ApplicationName)
 
 	rejectedRouters = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: ApplicationName + "_webhook_routers_rejected",
 		Help: "This is the number of webhook router configs viewed - either in app config or found as valid routers in the additional router config directory - and determined unworkable",
 	})
 	rejectedRouters.Set(float64(routersRejected))
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_routers_rejected", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_routers_rejected", ApplicationName)
 
 	// connectionMutex, connectionGauge defined further below near the main API handler function
 	connectionGauge = promauto.NewGauge(prometheus.GaugeOpts{
@@ -613,27 +580,21 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of active connections to the webhook router (active connections from an Alertmanager)",
 	})
 	connectionGauge.Set(0)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_connections", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_connections", ApplicationName)
 
 	connectionCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests",
 		Help: "Total number of webhook requests seen",
 	})
 	prometheus.MustRegister(connectionCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests", ApplicationName)
 
 	healthzCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_healthz_count",
 		Help: "Total number of /healthz health check requests",
 	})
 	prometheus.MustRegister(healthzCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_healthz_count", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_healthz_count", ApplicationName)
 
 	// webhookreq* mutex and prometheus metric variables defined further below near main API handler function
 	webhookreqAttemptedCounter = prometheus.NewCounter(prometheus.CounterOpts{
@@ -641,27 +602,21 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and attempted",
 	})
 	prometheus.MustRegister(webhookreqAttemptedCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests_attempted", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests_attempted", ApplicationName)
 
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests_successful",
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed (destination answered with a 2xx status)",
 	})
 	prometheus.MustRegister(webhookreqSuccessfulCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests_successful", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests_successful", ApplicationName)
 
 	// Set up SIGHUP handler for reloading routers
 	hupChan := make(chan os.Signal, 4)
 	go func(hupchan chan os.Signal, w *WebhookServer) {
 		for {
 			<-hupchan
-			if DEBUGLEVEL_TRACE {
-				log.Println("SIGHUP received")
-			}
+			infof("SIGHUP received")
 			err := w.ReloadRouters()
 			if err != nil {
 				// True to the same behavior as .Start(), if there are no routers defined, we bomb.
@@ -674,9 +629,7 @@ func (w *WebhookServer) Start() error {
 		}
 	}(hupChan, w)
 	signal.Notify(hupChan, syscall.SIGHUP)
-	if DEBUGLEVEL_DEBUG {
-		log.Println("Listening for SIGHUP to reload the router list")
-	}
+	infof("Listening for SIGHUP to reload the router list")
 
 	// Set up ReloadTriggerFile watcher for reloading routers
 	if w.ReloadTriggerFile != "" {
@@ -704,9 +657,7 @@ func (w *WebhookServer) Start() error {
 				time.Sleep(5 * time.Second)
 			}
 		}(w.ReloadTriggerFile, w)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Watching every 5 seconds for trigger file [%s] to reload the router list", w.ReloadTriggerFile)
-		}
+		infof("Watching every 5 seconds for trigger file [%s] to reload the router list", w.ReloadTriggerFile)
 	}
 
 	// Set up AdditionalRouterDirectory watcher for reloading routers when the directory contents change.
@@ -720,9 +671,7 @@ func (w *WebhookServer) Start() error {
 					continue
 				}
 				lastSum = sum
-				if DEBUGLEVEL_DEBUG {
-					log.Printf("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
-				}
+				infof("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
 				err := w.ReloadRouters()
 				if err != nil {
 					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
@@ -733,9 +682,7 @@ func (w *WebhookServer) Start() error {
 				routerMutex.Unlock()
 			}
 		}(addlRouterDirSum, w)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
-		}
+		infof("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
 	}
 
 	// Set up Prometheus metrics config
@@ -764,12 +711,8 @@ func (w *WebhookServer) Start() error {
 
 	GlobalWebhookServer = w // so the handler functions can find us
 	listenStr := fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
-	if DEBUGLEVEL_INFO {
-		log.Printf("WebhookServer listening on: %s\n", listenStr)
-	}
-	if DEBUGLEVEL_DEBUG {
-		log.Printf("All URIs: %#v\n", allURIs)
-	}
+	infof("WebhookServer listening on: %s\n", listenStr)
+	debugf("All URIs: %#v\n", allURIs)
 	log.Fatal(http.ListenAndServe(listenStr, nil))
 	return nil
 }
@@ -812,8 +755,8 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	healthzCounter.Inc()
 	healthzMutex.Unlock()
 
-	if DEBUGLEVEL_TRACE && ENABLE_HEALTHZ_DEBUG {
-		log.Printf("Received healthz request [%#v]", r)
+	if ENABLE_HEALTHZ_DEBUG {
+		tracef("Received healthz request [%#v]", r)
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Up\n"))
@@ -854,9 +797,7 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 	// POST only allowed
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Received HTTP request with invalid method [%s] - expecting POST", r.Method)
-		}
+		debugf("Received HTTP request with invalid method [%s] - expecting POST", r.Method)
 		fmt.Fprintf(w, "Invalid request method [%s] - we only expect the use of POST with this endpoint\r\n", r.Method)
 		return
 	}
@@ -865,17 +806,13 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Error reading request body [%v]", err)
-		}
+		warnf("Error reading request body [%v]", err)
 		fmt.Fprintf(w, "Error reading request body [%v]\r\n", err)
 		return
 	}
 	defer r.Body.Close()
 
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, body)
-	}
+	tracef("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, body)
 
 	// Unmarshal what we expect to be an Alertmanager webhook request
 	b := bytes.NewBuffer(body)
@@ -885,33 +822,25 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, "Error processing webhook from POST data [%v]\r\n", err)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Received POST data but could not unmarshal into an AlertmanagerWebhookInputV4: %v", err)
-		}
+		warnf("Received POST data but could not unmarshal into an AlertmanagerWebhookInputV4: %v", err)
 		return
 	}
 
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Received the following alert webhook:\n%s\n", alertwebhook.String())
+	if logEnabled(logLevelTrace) {
+		tracef("Received the following alert webhook:\n%s\n", alertwebhook.String())
 	}
 
 	// Find routers that might want to receive this
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Processing through %d routers-", len(GlobalWebhookServer.GetRouters()))
-	}
+	tracef("Processing through %d routers-", len(GlobalWebhookServer.GetRouters()))
 	for _, r := range GlobalWebhookServer.GetRouters() {
 		hasMatching := 0
 		for _, m := range r.Matchers {
-			if DEBUGLEVEL_TRACE {
-				log.Printf("evaluating matcher: %s\n", m.String())
-			}
+			tracef("evaluating matcher: %s\n", m.String())
 			if m.HasMatchingAlerts(alertwebhook) {
 				hasMatching++
 			}
 		}
-		if DEBUGLEVEL_TRACE {
-			log.Printf("evaluating webhook against router: found %d matchers that matched vs %d matchers\n", hasMatching, len(r.Matchers))
-		}
+		tracef("evaluating webhook against router: found %d matchers that matched vs %d matchers\n", hasMatching, len(r.Matchers))
 		if hasMatching == len(r.Matchers) {
 			// This router completely triggers on this alert; process it
 			webhookreqAttemptedMutex.Lock()
@@ -922,9 +851,7 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 			if err == nil {
 				r.SendWebhook(templated)
 			} else {
-				if DEBUGLEVEL_DEBUG {
-					log.Printf("Attempted to route a webhook but failed: %v", err)
-				}
+				warnf("Attempted to route a webhook but failed: %v", err)
 			}
 		}
 	}

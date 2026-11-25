@@ -14,11 +14,7 @@ import (
 
 const ApplicationName = `spitter`
 
-// TODO: Implement a better debug log system
-const DEBUGLEVEL_TRACE = true
-const DEBUGLEVEL_DEBUG = true
-const DEBUGLEVEL_INFO = true
-const DEBUGLEVEL_WARNING = true
+// Health checks arrive every few seconds; logging them drowns everything else, even at trace
 const ENABLE_HEALTHZ_DEBUG = false
 
 var CLI struct {
@@ -29,6 +25,7 @@ var CLI struct {
 		RouterDir     string        `optional:"" name:"routers" env:"SPITTER_ROUTERS_DIR" help:"Directory full of webhook router YAML or JSON configuration documents"`
 		RouterWatch   time.Duration `optional:"" name:"routers-watch-interval" env:"SPITTER_ROUTERS_WATCH_INTERVAL" help:"Poll the --routers directory at this interval (e.g. 10s) and reload routers when its contents change.  0 disables."`
 		ReloadTrigger string        `optional:"" name:"reload-trigger" env:"SPITTER_RELOAD_TRIGGER" help:"File to watch indicating a reload of router config is necessary; file is deleted after reload.  SIGHUP also performs this."`
+		LogLevel      string        `optional:"" name:"log-level" env:"SPITTER_LOG_LEVEL" help:"trace, debug, info or warning.  trace (the default) logs request headers, payloads and rendered templates, which can hold secrets."`
 	} `cmd:"" help:"Run a webhook router server receiving Alertmanager V4 webhooks"`
 	Dump struct {
 		Listen string `optional:"" name:"listen" help:"Hostname or IP address of interface to listen"`
@@ -85,6 +82,14 @@ func main() {
 		}
 		if CLI.Router.ReloadTrigger != "" {
 			configObj.ReloadTriggerFile = CLI.Router.ReloadTrigger
+		}
+		if CLI.Router.LogLevel != "" {
+			configObj.LogLevel = CLI.Router.LogLevel
+		}
+		if configObj.LogLevel != "" {
+			if err := setLogLevel(configObj.LogLevel); err != nil {
+				log.Fatalf("%v\n", err)
+			}
 		}
 
 		// Run the webhook routing server
