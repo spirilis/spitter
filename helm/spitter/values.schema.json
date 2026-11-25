@@ -39,6 +39,7 @@
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
         "alertmanagerURL": { "type": "string" },
         "prometheusURL": { "type": "string" },
+        "logLevel": { "type": "string", "enum": ["", "trace", "debug", "info", "warning", "warn"] },
         "metricsPath": { "type": "string", "pattern": "^/" },
         "routers": {
           "type": "array",
@@ -181,6 +182,15 @@
       },
       "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
       "then": { "properties": { "parentRefs": { "minItems": 1 } } }
+    },
+    "networkPolicy": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "from": { "$ref": "#/definitions/objectList" },
+        "extraFrom": { "$ref": "#/definitions/objectList" },
+        "extraIngress": { "$ref": "#/definitions/objectList" }
+      }
     },
     "metrics": {
       "type": "object",

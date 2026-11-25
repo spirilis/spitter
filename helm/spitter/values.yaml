@@ -25,6 +25,12 @@ spitter:
   alertmanagerURL: ""
   prometheusURL: ""
 
+  # trace, debug, info or warning.  info reports startup, reloads and everything that loses an alert (rejected
+  # routers, failed sends, refused payloads).  debug adds each router as it is loaded.  trace adds request headers,
+  # alert payloads, rendered templates and destination responses, any of which can hold secrets.
+  # Set to "" to leave the level to the config file's logLevel, or to spitter's own default (trace).
+  logLevel: info
+
   # Path serving Prometheus metrics.  With existingConfig, set this to the metrics.path in your config file.
   metricsPath: /metrics
 
@@ -144,6 +150,40 @@ httpRoute:
             value: /v4/alertmanager
       # timeouts:
       #   request: 30s
+
+# NetworkPolicy limiting who can connect to the spitter pods.  The webhook endpoint has no authentication of its
+# own: anyone who reaches it can have alerts sent to your routers' destinations.
+#
+# The policy is only created when the callers can be named:
+#   - spitter is reachable inside the cluster only (ClusterIP Service, no Ingress, no HTTPRoute), or
+#   - extraFrom lists who delivers the traffic from outside.
+# Otherwise no policy is created and the release notes say so.  It needs a CNI that enforces NetworkPolicy, and it
+# does not limit where spitter itself connects to.
+networkPolicy:
+  enabled: true
+  # NetworkPolicyPeers allowed to reach spitter's port: Alertmanager, to post webhooks, and Prometheus, to scrape
+  # metrics, in any namespace.  These are the labels prometheus-operator (kube-prometheus-stack) puts on its pods;
+  # check yours with "kubectl get pods -A -l app.kubernetes.io/name=alertmanager".  An Alertmanager that this list
+  # does not match can no longer deliver alerts.  Setting this replaces the whole list.
+  from:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: alertmanager
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+  # More NetworkPolicyPeers for the same port, e.g. your ingress controller's or gateway's pods, or the address of
+  # an Alertmanager outside the cluster.
+  extraFrom: []
+  # - namespaceSelector:
+  #     matchLabels:
+  #       kubernetes.io/metadata.name: ingress-nginx
+  # - ipBlock:
+  #     cidr: 203.0.113.10/32
+  # More ingress rules, passed through as written, e.g. for the ports of extraContainers.
+  extraIngress: []
 
 metrics:
   # prometheus-operator PodMonitor scraping spitter.metricsPath on the http port.

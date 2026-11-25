@@ -89,6 +89,56 @@ Rules are passed through as written (matches, filters, timeouts, ...), with `bac
 spitter Service.  When the Gateway lives in another namespace, its listener's `allowedRoutes` must admit this
 release's namespace.
 
+## Network policy
+
+spitter's webhook endpoint has no authentication: anyone who can reach it can have alerts sent to your routers'
+destinations.  By default the chart therefore creates a NetworkPolicy that only lets Alertmanager (to post webhooks)
+and Prometheus (to scrape metrics) connect to the spitter pods:
+
+```yaml
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector: {}        # any namespace
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: alertmanager
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+```
+
+Those are the labels prometheus-operator (kube-prometheus-stack) puts on its pods.  **If your Alertmanager's pods
+are labelled differently, the policy blocks its webhooks**: check with
+`kubectl get pods -A -l app.kubernetes.io/name=alertmanager`, and replace `networkPolicy.from` to match yours, or
+set `networkPolicy.enabled: false`.
+
+The policy can only be created when the callers can be named.  Once spitter is exposed outside the cluster
+(Ingress, HTTPRoute, NodePort or LoadBalancer), the traffic arrives from your ingress controller, gateway or an
+outside address, which the chart cannot know.  It then creates no policy, and says so in the release notes, unless
+`networkPolicy.extraFrom` names those callers:
+
+```yaml
+networkPolicy:
+  extraFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    # - ipBlock:
+    #     cidr: 203.0.113.10/32    # an Alertmanager outside the cluster
+```
+
+The policy covers ingress only, so spitter's connections to its destinations are unaffected, and it needs a CNI
+that enforces NetworkPolicy.  `networkPolicy.extraIngress` adds whole rules, e.g. for the ports of `extraContainers`.
+
+## Logging
+
+`spitter.logLevel` (default `info`) is passed as `SPITTER_LOG_LEVEL`.  `info` reports startup, reloads and everything
+that loses an alert: rejected routers, failed sends and refused payloads.  `trace` adds request headers, alert
+payloads, rendered templates and destination responses, which is useful while writing templates but can put secrets
+in the log.  Destination URLs appear in warnings at every level.
+
 ## Router configuration
 
 There are three ways to provide routers, and they can be combined:
@@ -113,6 +163,7 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `image.digest` | `""` | Pin by digest; wins over `tag`. |
 | `spitter.port` | `9820` | Container listen port. |
 | `spitter.alertmanagerURL` / `spitter.prometheusURL` | `""` | External base URLs used to rewrite alert links.  Required unless `existingConfig` is set. |
+| `spitter.logLevel` | `info` | `trace`, `debug`, `info` or `warning`; `""` leaves it to the config file or spitter's default (`trace`). |
 | `spitter.metricsPath` | `/metrics` | Metrics path (also used by the PodMonitor). |
 | `spitter.routers` | `[]` | Inline routers. |
 | `spitter.configInSecret` | `false` | Store the generated config in a Secret. |
@@ -128,6 +179,9 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `service.extraPorts` | `[]` | Additional ServicePorts, e.g. for sidecars. |
 | `ingress.*` | disabled | `networking.k8s.io/v1` Ingress. |
 | `httpRoute.*` | disabled | Gateway API HTTPRoute. |
+| `networkPolicy.enabled` | `true` | NetworkPolicy admitting only the peers below; skipped when spitter is exposed externally and `extraFrom` is empty. |
+| `networkPolicy.from` | Alertmanager and Prometheus pods in any namespace | Peers allowed to reach spitter's port. |
+| `networkPolicy.extraFrom` / `networkPolicy.extraIngress` | `[]` | More peers for spitter's port / more ingress rules. |
 | `metrics.podMonitor.*` | disabled | prometheus-operator PodMonitor (`labels`, `interval`, `relabelings`, ...). |
 | `autoscaling.*` | disabled | HorizontalPodAutoscaler (`autoscaling/v2`). |
 | `podDisruptionBudget.*` | disabled | PodDisruptionBudget. |
