@@ -8,6 +8,7 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -207,6 +209,9 @@ func (m *WebhookMatcher) HasMatchingAlerts(a *alerts.AlertmanagerWebhookInputV4)
 	}
 
 	for _, l := range a.Alerts {
+		if l == nil {
+			continue
+		}
 		for k, v := range l.Labels {
 			if m.IsMatch(k, v) {
 				return true
@@ -341,8 +346,28 @@ func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4
 	}
 
 	tmpAlert.Alerts = subsetAlerts
+	// The group's status may have come from alerts this router does not receive
+	tmpAlert.Status = statusOf(subsetAlerts, tmpAlert.Status)
 
 	return tmpAlert, nil
+}
+
+// statusOf works out a status for a filtered list of alerts the way Alertmanager does for a group: firing if any alert
+// is firing, resolved if all are resolved.  Anything else keeps the fallback.
+func statusOf(list []*alerts.AlertmanagerAlertV4, fallback string) string {
+	if len(list) == 0 {
+		return fallback
+	}
+	for _, al := range list {
+		switch al.Status {
+		case "firing":
+			return "firing"
+		case "resolved":
+		default:
+			return fallback
+		}
+	}
+	return "resolved"
 }
 
 // Operational function to execute the router's template and submit the webhook to its destination
@@ -814,48 +839,63 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 
 	tracef("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, body)
 
-	// Unmarshal what we expect to be an Alertmanager webhook request
-	b := bytes.NewBuffer(body)
-	dec := yaml.NewDecoder(b)
+	// Alertmanager sends JSON.  Decoding it as anything looser would refuse or alter text that JSON carries untouched.
 	alertwebhook := new(alerts.AlertmanagerWebhookInputV4)
-	err = dec.Decode(alertwebhook)
-	if err != nil {
+	if err := json.Unmarshal(body, alertwebhook); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, "Error processing webhook from POST data [%v]\r\n", err)
-		warnf("Received POST data but could not unmarshal into an AlertmanagerWebhookInputV4: %v", err)
+		warnf("Refusing a webhook: POST data is not an Alertmanager webhook in JSON: %v", err)
 		return
 	}
+	// Nothing can be routed from a payload we do not understand, so do not tell Alertmanager it was delivered
+	if alertwebhook.Version != alerts.WebhookVersion {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Unsupported webhook version [%s] - this endpoint expects version %s\r\n", alertwebhook.Version, alerts.WebhookVersion)
+		warnf("Refusing a webhook: version is [%s], expected [%s]", alertwebhook.Version, alerts.WebhookVersion)
+		return
+	}
+	// A null in the alert list carries nothing to route
+	alertwebhook.Alerts = slices.DeleteFunc(alertwebhook.Alerts, func(al *alerts.AlertmanagerAlertV4) bool { return al == nil })
 
 	if logEnabled(logLevelTrace) {
 		tracef("Received the following alert webhook:\n%s\n", alertwebhook.String())
 	}
 
-	// Find routers that might want to receive this
-	tracef("Processing through %d routers-", len(GlobalWebhookServer.GetRouters()))
-	for _, r := range GlobalWebhookServer.GetRouters() {
-		hasMatching := 0
-		for _, m := range r.Matchers {
-			tracef("evaluating matcher: %s\n", m.String())
-			if m.HasMatchingAlerts(alertwebhook) {
-				hasMatching++
-			}
-		}
-		tracef("evaluating webhook against router: found %d matchers that matched vs %d matchers\n", hasMatching, len(r.Matchers))
-		if hasMatching == len(r.Matchers) {
-			// This router completely triggers on this alert; process it
-			webhookreqAttemptedMutex.Lock()
-			webhookreqAttemptedCounter.Inc()
-			webhookreqAttemptedMutex.Unlock()
-
-			templated, err := r.PrepareTemplateData(alertwebhook)
-			if err == nil {
-				r.SendWebhook(templated)
-			} else {
-				warnf("Attempted to route a webhook but failed: %v", err)
-			}
-		}
+	routers := GlobalWebhookServer.GetRouters()
+	tracef("Processing through %d routers-", len(routers))
+	for _, router := range routers {
+		routeWebhook(router, alertwebhook)
 	}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("\r\n"))
+}
+
+// routeWebhook sends the webhook through one router, if the router wants any of it
+func routeWebhook(r *WebhookRouter, a *alerts.AlertmanagerWebhookInputV4) {
+	// Cheap first pass: every matcher must find something somewhere in the group
+	for _, m := range r.Matchers {
+		if !m.HasMatchingAlerts(a) {
+			tracef("router [URL=\"%s\"] skipped: nothing matches %s", r.DestURL, m)
+			return
+		}
+	}
+
+	templated, err := r.PrepareTemplateData(a)
+	if err != nil {
+		warnf("Attempted to route a webhook to [URL=\"%s\"] but failed: %v", r.DestURL, err)
+		return
+	}
+	// The matchers were satisfied by different alerts and no single alert satisfies them all
+	if len(templated.Alerts) == 0 && len(a.Alerts) > 0 {
+		tracef("router [URL=\"%s\"] skipped: no alert satisfies every matcher", r.DestURL)
+		return
+	}
+
+	webhookreqAttemptedMutex.Lock()
+	webhookreqAttemptedCounter.Inc()
+	webhookreqAttemptedMutex.Unlock()
+
+	// SendWebhook reports its own failures
+	r.SendWebhook(templated)
 }

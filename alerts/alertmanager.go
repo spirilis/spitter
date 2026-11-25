@@ -93,20 +93,25 @@ func (r *RoutingConfig) IsInitialized() bool {
 	  ]
 	}
 */
+// Alertmanager sends this as JSON, and the webhook handler decodes it with encoding/json.  The yaml tags let tests and
+// tools write the same payload as YAML.
 type AlertmanagerWebhookInputV4 struct {
-	Version             string                 `yaml:"version"`
-	GroupKey            string                 `yaml:"groupKey"`
-	TruncatedAlertCount int                    `yaml:"truncatedAlerts"`
-	Status              string                 `yaml:"status"` // enum: resolved, firing
-	Receiver            string                 `yaml:"receiver"`
-	GroupLabels         map[string]string      `yaml:"groupLabels"`       // K=V map
-	CommonLabels        map[string]string      `yaml:"commonLabels"`      // K=V map
-	CommonAnnotations   map[string]string      `yaml:"commonAnnotations"` // K=V map
-	RouteLabels         map[string]string      `yaml:"routeLabels"`       // K=V map; Alertmanager 0.34+ (route "labels:")
-	ExternalURL         string                 `yaml:"externalURL"`
-	NotificationReason  string                 `yaml:"notification_reason"` // Alertmanager 0.32+, e.g. "first notification", "all alerts resolved"
-	Alerts              []*AlertmanagerAlertV4 `yaml:"alerts"`
+	Version             string                 `json:"version" yaml:"version"`
+	GroupKey            string                 `json:"groupKey" yaml:"groupKey"`
+	TruncatedAlertCount int                    `json:"truncatedAlerts" yaml:"truncatedAlerts"`
+	Status              string                 `json:"status" yaml:"status"` // enum: resolved, firing
+	Receiver            string                 `json:"receiver" yaml:"receiver"`
+	GroupLabels         map[string]string      `json:"groupLabels" yaml:"groupLabels"`             // K=V map
+	CommonLabels        map[string]string      `json:"commonLabels" yaml:"commonLabels"`           // K=V map
+	CommonAnnotations   map[string]string      `json:"commonAnnotations" yaml:"commonAnnotations"` // K=V map
+	RouteLabels         map[string]string      `json:"routeLabels" yaml:"routeLabels"`             // K=V map; Alertmanager 0.34+ (route "labels:")
+	ExternalURL         string                 `json:"externalURL" yaml:"externalURL"`
+	NotificationReason  string                 `json:"notification_reason" yaml:"notification_reason"` // Alertmanager 0.32+, e.g. "first notification", "all alerts resolved"
+	Alerts              []*AlertmanagerAlertV4 `json:"alerts" yaml:"alerts"`
 }
+
+// WebhookVersion is the only payload version spitter understands
+const WebhookVersion = "4"
 
 type AlertmanagerWebhookVersionInvalid string
 
@@ -114,6 +119,9 @@ func (a AlertmanagerWebhookVersionInvalid) Error() string {
 	return "Alertmanager Webhook returned invalid version: " + string(a)
 }
 
+// AlertmanagerAlertV4 is both decoded from the payload and handed to templates.  It deliberately has no json tags:
+// encoding/json matches these field names to Alertmanager's keys regardless of case, and tags would rename the keys
+// that {{ .Alerts | toJson }} prints in existing templates.
 type AlertmanagerAlertV4 struct {
 	Status               string            `yaml:"status"`      // enum: resolved, firing
 	Labels               map[string]string `yaml:"labels"`      // K=V map
@@ -145,7 +153,7 @@ type AlertmanagerWebhookTemplateV4 struct {
 // Prepare is the operative function to take an accepted Alertmanager webhook request and "format" it to execute
 // as data to the template function.  URLs are transmuted, OS environment is added.
 func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, error) {
-	if a.Version != "4" {
+	if a.Version != WebhookVersion {
 		return nil, AlertmanagerWebhookVersionInvalid(a.Version)
 	}
 	if !GlobalRoutingConfig.IsInitialized() {
@@ -169,12 +177,14 @@ func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, 
 	tmpval.OriginalExternalURL = a.ExternalURL
 	// Transmute prometheus URL in each alert's GeneratorURL
 	for _, l := range a.Alerts {
-		maps.Copy(l.Labels, a.CommonLabels)
-		maps.Copy(l.Annotations, a.CommonAnnotations)
+		if l == nil {
+			continue
+		}
 		newAlert := &AlertmanagerAlertV4{
-			Status:      l.Status,
-			Labels:      l.Labels,
-			Annotations: l.Annotations,
+			Status: l.Status,
+			// Fresh maps: the payload is prepared once per matching router and must come out the same each time
+			Labels:      mergeMaps(l.Labels, a.CommonLabels),
+			Annotations: mergeMaps(l.Annotations, a.CommonAnnotations),
 			StartsAt:    l.StartsAt,
 			EndsAt:      l.EndsAt,
 			Fingerprint: l.Fingerprint,
@@ -196,6 +206,14 @@ func (a *AlertmanagerWebhookInputV4) Prepare() (*AlertmanagerWebhookTemplateV4, 
 	}
 
 	return tmpval, nil
+}
+
+// mergeMaps returns a new map holding own with common laid over it.  Either may be nil; the result never is.
+func mergeMaps(own, common map[string]string) map[string]string {
+	out := make(map[string]string, len(own)+len(common))
+	maps.Copy(out, own)
+	maps.Copy(out, common)
+	return out
 }
 
 func (a *AlertmanagerWebhookInputV4) String() string {
