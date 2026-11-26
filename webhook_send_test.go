@@ -16,8 +16,11 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// Start registers this counter, but SendWebhook is called here without starting a server
+	// Start registers these, but the tests call SendWebhook and the handler without starting a server
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{Name: "test_webhook_requests_successful"})
+	webhookreqAttemptedCounter = prometheus.NewCounter(prometheus.CounterOpts{Name: "test_webhook_requests_attempted"})
+	connectionCounter = prometheus.NewCounter(prometheus.CounterOpts{Name: "test_webhook_requests"})
+	connectionGauge = prometheus.NewGauge(prometheus.GaugeOpts{Name: "test_webhook_connections"})
 	os.Exit(m.Run())
 }
 

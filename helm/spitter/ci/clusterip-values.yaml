@@ -5,7 +5,9 @@ spitter:
     - url: http://receiver.example.com/hook
       contentType: application/json
       template: |-
-        {"status": "{{ .Status }}", "alerts": {{ len .Alerts }}}
+        {"status": {{ .Status | toJson }}, "alerts": {{ len .Alerts }}}
       matchers:
         - label: severity
           match_re: ".*"
+networkPolicy:
+  enabled: true

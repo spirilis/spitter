@@ -7,6 +7,63 @@ functions) and sends the result to its own destination URL.  Links inside alerts
 reachable Alertmanager/Prometheus URLs along the way.  See [`examples/webhook_server.yml`](examples/webhook_server.yml)
 for a config file with routers, and [`PROMETHEUS-METRICS.md`](PROMETHEUS-METRICS.md) for the metrics it exports.
 
+## Receiving webhooks
+
+Point an Alertmanager `webhook_config` at `http://<spitter>:9820/v4/alertmanager/webhook`.  The payload must be
+Alertmanager's own JSON, version 4; spitter answers `400` to anything else, which Alertmanager treats as final.
+Once a payload is accepted the answer is `200`, whether or not every router's destination took its webhook:
+failures are logged as warnings and show in the [metrics](PROMETHEUS-METRICS.md), but are not retried.
+
+A router receives a notification when at least one alert in the group satisfies **all** of its matchers, and it
+receives only those alerts.  `match` compares the label's value exactly; `match_re` is an unanchored regular
+expression, so `crit` also matches `critical`.
+
+Limits on the listener, both under `listen:` in the config file:
+
+- `maxBodyBytes` (default 10 MiB, `10485760`): a larger body is answered with `413`.  Alertmanager does not retry
+  that, so the notification is lost; set `max_alerts` on its `webhook_config` if your groups get that large.
+- `idleTimeout` (default `10m`, negative for none): how long an idle keep-alive connection is kept.  It should be
+  longer than the idle timeout of whatever calls spitter, so that the caller is the one to close first:
+  Alertmanager's is 5 minutes, and a proxy in front of spitter has its own.
+
+A request must send its headers within 10 seconds and arrive in full within 30.  How long spitter then takes to
+answer is not limited, since it sends to every matching router first.
+
+The endpoint has no authentication.  Keep it reachable by Alertmanager only: the Helm chart does this with a
+NetworkPolicy when `networkPolicy.enabled` is set.
+
+## Template data
+
+Each router's template is a Go [`text/template`](https://pkg.go.dev/text/template) with the sprig functions.  It
+receives the Alertmanager v4 webhook, with these fields:
+
+| Field | Notes |
+| --- | --- |
+| `.Version`, `.GroupKey`, `.TruncatedAlertCount`, `.Receiver` | As sent by Alertmanager (`truncatedAlerts` becomes `.TruncatedAlertCount`). |
+| `.Status` | `firing` or `resolved`.  When the router receives only some of the group's alerts, it describes those: `firing` if any of them is. |
+| `.GroupLabels`, `.CommonLabels`, `.CommonAnnotations` | Maps. |
+| `.RouteLabels` | Map of the matching route's rendered `labels:` (Alertmanager 0.34+; empty before). |
+| `.NotificationReason` | Why Alertmanager sent it: `first notification`, `new alerts added`, `some alerts resolved`, `all alerts resolved`, `repeat interval elapsed` or `unknown` (Alertmanager 0.32+; empty before). |
+| `.ExternalURL` / `.OriginalExternalURL` | Alertmanager link rewritten onto the configured Alertmanager URL / as sent. |
+| `.Env` | The process environment.  Anything in it, secrets included, can be rendered into a payload. |
+| `.Alerts` | Only the alerts that match this router's matchers. |
+
+Each alert has `.Status`, `.Labels` and `.Annotations` (with the common ones merged in), `.StartsAt` and `.EndsAt`
+(RFC3339 strings; use sprig's `toDate` to format them), `.GeneratorURL` / `.OriginalGeneratorURL` (rewritten onto
+the configured Prometheus URL / as sent) and `.Fingerprint`.
+
+### Building JSON
+
+Write values into a JSON payload with sprig's `toJson`, which adds the quotes and escaping and also takes whole maps:
+
+```
+{"status": {{ .Status | toJson }}, "summary": {{ .CommonAnnotations.summary | toJson }}, "labels": {{ .CommonLabels | toJson }}}
+```
+
+Do not put a value between quotes yourself (`"{{ .CommonAnnotations.summary }}"`).  One quote or newline in the text
+breaks the payload, and whoever writes the alert's text can then add fields of their own.  `{{ . | toJson }}` prints
+the whole payload; `.Env` is left out of it.
+
 ## Router authentication and TLS
 
 Each router can authenticate to its destination and choose how the destination's certificate is checked:
@@ -16,7 +73,7 @@ routers:
 - url: https://receiver.example.com/hook
   auth:
     token: s3cret                # "Authorization: Bearer s3cret"
-    # tokenFile: /path/to/token  # same, read from a file (surrounding whitespace is trimmed)
+    # tokenFile: /path/to/token  # same, read from the file for every webhook (surrounding whitespace is trimmed)
     # basicAuth:                 # "Authorization: Basic ..."
     #   username: spitter
     #   password: s3cret
@@ -30,8 +87,27 @@ routers:
 
 HTTPS certificates are verified against the system CA roots unless `tls` says otherwise.  Earlier versions of
 spitter never verified them, so a router pointing at a self-signed endpoint now fails until it sets `tls.caFile`
-(preferred) or `tls.insecureSkipVerify: true`.  A router whose `caFile` cannot be read or holds no certificates is
-rejected at load time, like one whose `tokenFile` is missing.  Each outbound webhook times out after 30 seconds.
+(preferred) or `tls.insecureSkipVerify: true`.  Each outbound webhook times out after 30 seconds.
+
+Set only one of `token`, `tokenFile` and `basicAuth`.  Because `tokenFile` is read for every webhook, a token that
+is rotated on disk is picked up without a reload; if the file is missing or empty at that moment, the webhook is not
+sent.
+
+## Router validation
+
+Routers are checked when they are loaded, at startup and on every reload.  A router that fails is left out, logged
+as a warning and counted in `spitter_webhook_routers_rejected`; the others keep working.  A router is rejected when:
+
+- its `url` is not an `http://` or `https://` address with a host, or its `method` is not a valid HTTP method;
+- its `template` does not parse;
+- it has no matchers, or a matcher has no `label`, has neither `match` nor `match_re`, or has an invalid `match_re`;
+- its `auth` sets more than one of `token`, `tokenFile` and `basicAuth`, or a `basicAuth` password without a username;
+- its `tokenFile` or `tls.caFile` cannot be read, or the `caFile` holds no certificates;
+- its document has a key spitter does not know, or the same key twice.  A misspelled `auth:` or `tls:` would
+  otherwise be dropped and the router sent without its credentials.
+
+The config file itself is read the same way: an unknown key stops spitter at startup.  If no router at all is
+valid, spitter exits, at startup and on a reload alike.
 
 ## Building
 
@@ -48,6 +124,14 @@ cross-compiles, so multi-arch builds need no emulation:
 ```sh
 docker build -t spirilis/spitter:dev .
 docker buildx build --platform linux/amd64,linux/arm64 -t spirilis/spitter:0.2.0 --push .
+```
+
+[`deploy-assets-oci.sh`](deploy-assets-oci.sh) builds that multi-arch image and pushes it, together with the Helm
+chart, to an OCI registry of your choice.  The image is tagged with the chart's `appVersion`:
+
+```sh
+REGISTRY=oci.example.com ./deploy-assets-oci.sh   # image: library/spitter, chart: helm/spitter
+REGISTRY=oci.example.com IMAGE_REPO=team/spitter CHART_REPO=charts/spitter ./deploy-assets-oci.sh
 ```
 
 The image runs `spitter router` by default.  Mount a config file, or configure it with flags or environment
@@ -73,6 +157,11 @@ docker run --rm -p 9820:9820 -v "$PWD/routers:/routers:ro" \
 | `--routers` | `SPITTER_ROUTERS_DIR` | Directory of additional router documents, one per file. |
 | `--routers-watch-interval` | `SPITTER_ROUTERS_WATCH_INTERVAL` | Poll the routers directory and reload on change (e.g. `10s`). |
 | `--reload-trigger` | `SPITTER_RELOAD_TRIGGER` | Reload routers when this file appears, then delete it. |
+| `--log-level` | `SPITTER_LOG_LEVEL` | `trace`, `debug`, `info` or `warning`; also `logLevel:` in the config file.  Default `trace`. |
+
+`trace` logs request headers, alert payloads, rendered templates and destination responses, any of which can hold
+secrets; `info` is the level to run with once your templates work.  Destination URLs appear in warnings at every
+level.
 
 Routers are also reloaded on `SIGHUP`.  `spitter dump` runs a small server that prints every request it receives,
 which is handy as a webhook destination while developing templates.

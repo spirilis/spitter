@@ -8,18 +8,22 @@ import (
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"maps"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"syscall"
 	"text/template"
 	"time"
@@ -41,10 +45,13 @@ type WebhookRouter struct {
 	Authentication *WebhookAuthentication `yaml:"auth,omitempty"`
 	TLS            *WebhookTLS            `yaml:"tls,omitempty"`
 	Matchers       []*WebhookMatcher      `yaml:"matchers"`
-	// Set by prepare.  Every reload re-prepares inline routers while requests may still be using them.
-	client atomic.Pointer[http.Client]
+	// Set by Check and prepare.  A router that has been loaded is never changed again; every reload builds new ones.
+	tmpl   *template.Template
+	client *http.Client
 }
 
+// Check validates a router's configuration and compiles its template and regular expressions, so that a mistake rejects
+// the router when it is loaded instead of failing, or silently never matching, on every alert.
 func (r *WebhookRouter) Check() error {
 	if r == nil {
 		return errors.New("nil object")
@@ -52,9 +59,26 @@ func (r *WebhookRouter) Check() error {
 	if r.DestURL == "" {
 		return errors.New("missing URL")
 	}
+	u, err := url.Parse(r.DestURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL: %v", err)
+	}
+	if (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("URL must be an http:// or https:// address with a host")
+	}
+	if r.HttpMethod != "" {
+		if _, err := http.NewRequest(r.HttpMethod, r.DestURL, nil); err != nil {
+			return fmt.Errorf("invalid method: %v", err)
+		}
+	}
 	if r.Template == "" {
 		return errors.New("no template")
 	}
+	tmpl, err := template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template)
+	if err != nil {
+		return fmt.Errorf("template does not parse: %v", err)
+	}
+	r.tmpl = tmpl
 	if len(r.Matchers) < 1 {
 		return errors.New("no label matchers")
 	}
@@ -62,16 +86,50 @@ func (r *WebhookRouter) Check() error {
 		if m == nil {
 			return errors.New("nil label matcher")
 		}
-		// Compile match_re now so a bad expression rejects the router at load time instead of failing on every alert
+		if m.Label == "" {
+			return errors.New("label matcher has no label")
+		}
+		if m.MatchString == "" && m.MatchRegexp == "" {
+			return fmt.Errorf("label matcher for [%s] has neither match nor match_re, so it could never match", m.Label)
+		}
 		if err := m.compile(); err != nil {
-			log.Printf("Rejecting router for URL [%s]: label matcher [%s] has an invalid match_re: %v", r.DestURL, m, err)
 			return fmt.Errorf("label matcher [%s] has an invalid match_re: %v", m, err)
 		}
 	}
 	if r.Authentication == nil {
 		r.Authentication = &WebhookAuthentication{}
 	}
-	return nil
+	return r.Authentication.check()
+}
+
+// clone copies a router's configuration into a new router that has not been through Check or prepare
+func (r *WebhookRouter) clone() *WebhookRouter {
+	if r == nil {
+		return nil
+	}
+	c := &WebhookRouter{
+		DestURL:     r.DestURL,
+		HttpMethod:  r.HttpMethod,
+		Template:    r.Template,
+		ContentType: r.ContentType,
+	}
+	if r.Authentication != nil {
+		auth := *r.Authentication
+		auth.Cookies = maps.Clone(auth.Cookies)
+		c.Authentication = &auth
+	}
+	if r.TLS != nil {
+		tlsConfig := *r.TLS
+		c.TLS = &tlsConfig
+	}
+	for _, m := range r.Matchers {
+		if m == nil {
+			c.Matchers = append(c.Matchers, nil)
+			continue
+		}
+		c.Matchers = append(c.Matchers, &WebhookMatcher{Label: m.Label, MatchString: m.MatchString, MatchRegexp: m.MatchRegexp})
+	}
+	return c
 }
 
 type WebhookAuthentication struct {
@@ -90,29 +148,49 @@ func (a WebhookBasicAuth) AuthorizationHeader() string {
 	return "Basic " + string(base64.StdEncoding.EncodeToString([]byte(a.Username+":"+a.Password)))
 }
 
-func (wa *WebhookAuthentication) ResolveBearerToken() error {
+// check refuses settings that used to be resolved by silently preferring one, or by sending no credentials at all
+func (wa *WebhookAuthentication) check() error {
+	methods := 0
+	if wa.BearerToken != "" {
+		methods++
+	}
 	if wa.BearerTokenFromFile != "" {
-		contents, err := os.ReadFile(wa.BearerTokenFromFile)
-		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookAuthentication.ResolveBearerToken experienced error [%v] reading bearer token file %s", err, wa.BearerTokenFromFile)
-			}
-			return err
-		}
-		// Token files usually end in a newline, which is not valid in a header value
-		wa.BearerToken = strings.TrimSpace(string(contents))
+		methods++
+	}
+	if wa.BasicAuth.Username != "" || wa.BasicAuth.Password != "" {
+		methods++
+	}
+	if methods > 1 {
+		return errors.New("auth sets more than one of token, tokenFile and basicAuth")
+	}
+	if wa.BasicAuth.Username == "" && wa.BasicAuth.Password != "" {
+		return errors.New("auth.basicAuth has a password but no username")
 	}
 	return nil
 }
 
-func (wa *WebhookAuthentication) AuthorizationHeader() string {
+// AuthorizationHeader returns the Authorization header to send, or "" for none.  A token file is read every time, so
+// a token that is rotated on disk (a projected Kubernetes service account token, say) is picked up without a reload.
+func (wa *WebhookAuthentication) AuthorizationHeader() (string, error) {
+	if wa.BearerTokenFromFile != "" {
+		contents, err := os.ReadFile(wa.BearerTokenFromFile)
+		if err != nil {
+			return "", fmt.Errorf("reading auth.tokenFile: %w", err)
+		}
+		// Token files usually end in a newline, which is not valid in a header value
+		token := strings.TrimSpace(string(contents))
+		if token == "" {
+			return "", fmt.Errorf("auth.tokenFile %s is empty", wa.BearerTokenFromFile)
+		}
+		return "Bearer " + token, nil
+	}
 	if wa.BearerToken != "" {
-		return "Bearer " + wa.BearerToken
+		return "Bearer " + wa.BearerToken, nil
 	}
-	if wa.BasicAuth.Username != "" && wa.BasicAuth.Password != "" {
-		return wa.BasicAuth.AuthorizationHeader()
+	if wa.BasicAuth.Username != "" {
+		return wa.BasicAuth.AuthorizationHeader(), nil
 	}
-	return ""
+	return "", nil
 }
 
 // webhookClientTimeout bounds each outbound webhook, including reading the response.  Routers are sent to one after
@@ -148,7 +226,7 @@ func (wt *WebhookTLS) HTTPClient() (*http.Client, error) {
 	return &http.Client{Transport: transport, Timeout: webhookClientTimeout}, nil
 }
 
-// prepare applies a router's defaults and resolves what it needs to send webhooks: its bearer token and HTTP client.
+// prepare applies a router's defaults and resolves what it needs to send webhooks: its credentials and HTTP client.
 func (r *WebhookRouter) prepare() error {
 	if r.HttpMethod == "" {
 		r.HttpMethod = "POST"
@@ -156,16 +234,17 @@ func (r *WebhookRouter) prepare() error {
 	if r.ContentType == "" {
 		r.ContentType = "application/yaml"
 	}
-	if err := r.Authentication.ResolveBearerToken(); err != nil {
+	// A token file that cannot be read now would fail every send; reject the router while someone is looking
+	if _, err := r.Authentication.AuthorizationHeader(); err != nil {
 		return err
 	}
 	client, err := r.TLS.HTTPClient()
 	if err != nil {
 		return err
 	}
-	r.client.Store(client)
-	if r.TLS != nil && r.TLS.InsecureSkipVerify && DEBUGLEVEL_WARNING {
-		log.Printf("Router [URL=\"%s\"] does not verify its destination's TLS certificate (tls.insecureSkipVerify)", r.DestURL)
+	r.client = client
+	if r.TLS != nil && r.TLS.InsecureSkipVerify {
+		warnf("Router [URL=\"%s\"] does not verify its destination's TLS certificate (tls.insecureSkipVerify)", r.DestURL)
 	}
 	return nil
 }
@@ -210,6 +289,9 @@ func (m *WebhookMatcher) HasMatchingAlerts(a *alerts.AlertmanagerWebhookInputV4)
 	}
 
 	for _, l := range a.Alerts {
+		if l == nil {
+			continue
+		}
 		for k, v := range l.Labels {
 			if m.IsMatch(k, v) {
 				return true
@@ -255,7 +337,7 @@ func (m *WebhookMatcher) doesRegexpMatch(re string) bool {
 	}
 	// Normally a no-op since Check() already compiled it; covers matchers that never went through Check()
 	if err := m.compile(); err != nil {
-		log.Printf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
+		warnf("Error compiling regexp for regular expression [%s]: %v\n", m.MatchRegexp, err)
 		return false
 	}
 
@@ -274,11 +356,11 @@ func matcherListContains(sl []*WebhookMatcher, m *WebhookMatcher) bool {
 // IsMatchingAlert reports whether every one of the router's matchers is satisfied, either by the CommonLabels (matchedCommon) or by the alert's own labels
 func (r *WebhookRouter) IsMatchingAlert(l *alerts.AlertmanagerAlertV4, matchedCommon []*WebhookMatcher) bool {
 	if r == nil {
-		log.Println("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
+		warnf("WebhookRouter.IsMatchingAlert error - called with nil WebhookRouter")
 		return false
 	}
 	if l == nil {
-		log.Println("WebhookRouter.IsMatchingAlert error - called with nil Alert")
+		warnf("WebhookRouter.IsMatchingAlert error - called with nil Alert")
 		return false
 	}
 
@@ -344,87 +426,101 @@ func (r *WebhookRouter) PrepareTemplateData(a *alerts.AlertmanagerWebhookInputV4
 	}
 
 	tmpAlert.Alerts = subsetAlerts
+	// The group's status may have come from alerts this router does not receive
+	tmpAlert.Status = statusOf(subsetAlerts, tmpAlert.Status)
 
 	return tmpAlert, nil
 }
 
+// statusOf works out a status for a filtered list of alerts the way Alertmanager does for a group: firing if any alert
+// is firing, resolved if all are resolved.  Anything else keeps the fallback.
+func statusOf(list []*alerts.AlertmanagerAlertV4, fallback string) string {
+	if len(list) == 0 {
+		return fallback
+	}
+	for _, al := range list {
+		switch al.Status {
+		case "firing":
+			return "firing"
+		case "resolved":
+		default:
+			return fallback
+		}
+	}
+	return "resolved"
+}
+
 // Operational function to execute the router's template and submit the webhook to its destination
 func (r *WebhookRouter) SendWebhook(a *alerts.AlertmanagerWebhookTemplateV4) error {
+	if r.tmpl == nil || r.client == nil {
+		warnf("WebhookRouter.SendWebhook error - router [URL=\"%s\"] was not loaded through Check and prepare", r.DestURL)
+		return errors.New("WebhookRouter.SendWebhook error - router was not prepared and has no template or HTTP client")
+	}
+
 	b := &bytes.Buffer{}
 	b.Grow(len(r.Template)) // Not exact but hopefully accurate enough to reduce the # of memory reallocations
-
-	tp := template.Must(template.New("sendwebhook").Funcs(sprig.FuncMap()).Parse(r.Template))
-	if err := tp.Execute(b, a); err == nil {
-		if DEBUGLEVEL_TRACE {
-			log.Printf("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
-		}
-		client := r.client.Load()
-		if client == nil {
-			return errors.New("WebhookRouter.SendWebhook error - router was not prepared and has no HTTP client")
-		}
-		req, err := http.NewRequest(r.HttpMethod, r.DestURL, b)
-		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook error - cannot create an HTTP Request object for reason [%v]", err)
-			}
-			return fmt.Errorf("WebhookRouter.SendWebhook http.NewRequest error %v", err)
-		}
-
-		// Configure request parameters - content-type, cookies and/or bearer token or basic auth
-		req.Header.Set("Content-Type", r.ContentType)
-		if authHeader := r.Authentication.AuthorizationHeader(); authHeader != "" {
-			req.Header.Set("Authorization", authHeader)
-		}
-		if r.Authentication.Cookies != nil && len(r.Authentication.Cookies) > 0 {
-			for k, v := range r.Authentication.Cookies {
-				req.AddCookie(&http.Cookie{
-					Name:  k,
-					Value: v,
-				})
-			}
-		}
-
-		// Submit HTTP/HTTPS request
-		resp, err := client.Do(req)
-		if err != nil {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
-			}
-			return fmt.Errorf("WebhookRouter.SendWebhook error submitting HTTP request: %w", err)
-		}
-		defer func() {
-			// Drain the body so the connection goes back into the router's pool for the next webhook
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-		}()
-
-		respData, err := io.ReadAll(resp.Body)
-		if err != nil {
-			respData = []byte(fmt.Sprintf("(not available due to error [%v])", err))
-		}
-
-		// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, respData)
-			}
-			return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
-		}
-
-		// Successful send
-		webhookreqSuccessfulMutex.Lock()
-		webhookreqSuccessfulCounter.Inc()
-		webhookreqSuccessfulMutex.Unlock()
-
-		if DEBUGLEVEL_TRACE {
-			log.Printf("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
-		}
-	} else {
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("WebhookRouter.SendWebhook failed to execute template for reason [%v] on data [%#v]", err, a)
-		}
+	if err := r.tmpl.Execute(b, a); err != nil {
+		warnf("WebhookRouter.SendWebhook failed to execute template for URL=%s: %v", r.DestURL, err)
+		tracef("WebhookRouter.SendWebhook template data was [%#v]", a)
 		return fmt.Errorf("WebhookRouter.SendWebhook template Execute error %v", err)
 	}
+	if logEnabled(logLevelTrace) {
+		tracef("WebhookRouter.SendWebhook- Trace dumping template output:\n---\n%s\n---\n", b.String())
+	}
+
+	req, err := http.NewRequest(r.HttpMethod, r.DestURL, b)
+	if err != nil {
+		warnf("WebhookRouter.SendWebhook error - cannot create an HTTP Request object for reason [%v]", err)
+		return fmt.Errorf("WebhookRouter.SendWebhook http.NewRequest error %v", err)
+	}
+
+	// Configure request parameters - content-type, cookies and/or bearer token or basic auth
+	req.Header.Set("Content-Type", r.ContentType)
+	authHeader, err := r.Authentication.AuthorizationHeader()
+	if err != nil {
+		warnf("WebhookRouter.SendWebhook error - no credentials for URL=%s: %v", r.DestURL, err)
+		return fmt.Errorf("WebhookRouter.SendWebhook credentials error: %w", err)
+	}
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
+	for k, v := range r.Authentication.Cookies {
+		req.AddCookie(&http.Cookie{
+			Name:  k,
+			Value: v,
+		})
+	}
+
+	// Submit HTTP/HTTPS request
+	resp, err := r.client.Do(req)
+	if err != nil {
+		warnf("WebhookRouter.SendWebhook error submitting HTTP request: %v", err)
+		return fmt.Errorf("WebhookRouter.SendWebhook error submitting HTTP request: %w", err)
+	}
+	defer func() {
+		// Drain the body so the connection goes back into the router's pool for the next webhook
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}()
+
+	respData, err := io.ReadAll(resp.Body)
+	if err != nil {
+		respData = []byte(fmt.Sprintf("(not available due to error [%v])", err))
+	}
+
+	// Any 2xx means the destination accepted the webhook; plenty of APIs answer 201 Created, 202 Accepted or 204 No Content
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		warnf("WebhookRouter.SendWebhook failed: destination returned HTTP %s; URL=%s; method=%s; response=%s", resp.Status, r.DestURL, r.HttpMethod, logExcerpt(respData, 512))
+		tracef("WebhookRouter.SendWebhook failed: full response from URL=%s:\n%s", r.DestURL, respData)
+		return fmt.Errorf("WebhookRouter.SendWebhook destination %s returned HTTP %s", r.DestURL, resp.Status)
+	}
+
+	// Successful send
+	webhookreqSuccessfulMutex.Lock()
+	webhookreqSuccessfulCounter.Inc()
+	webhookreqSuccessfulMutex.Unlock()
+
+	tracef("WebhookRouter.SendWebhook successful send: URL=%s; method=%s; status=%s; response=%s", r.DestURL, r.HttpMethod, resp.Status, respData)
 	return nil
 }
 
@@ -439,6 +535,7 @@ type WebhookServer struct {
 	AdditionalRouterWatch     time.Duration         `yaml:"addlRouterDirWatchInterval,omitempty"`
 	ReloadTriggerFile         string                `yaml:"reloadTriggerFile,omitempty"`
 	Metrics                   *WebhookServerMetrics `yaml:"metrics,omitempty"`
+	LogLevel                  string                `yaml:"logLevel,omitempty"`
 	allRouters                []*WebhookRouter
 }
 
@@ -447,6 +544,50 @@ var GlobalWebhookServer *WebhookServer
 type WebhookServerListen struct {
 	Hostname string `yaml:"host,omitempty"`
 	Port     int    `yaml:"port,omitempty"`
+	// Largest webhook body accepted, in bytes.  Larger ones are answered with 413.  Default 10 MiB.
+	MaxBodyBytes int64 `yaml:"maxBodyBytes,omitempty"`
+	// How long a kept-alive connection may sit between requests before spitter closes it.  Default 10m; negative for
+	// no limit.  Keep it longer than the idle timeout of whatever calls spitter, or the caller may send a webhook
+	// down a connection that is just being closed.
+	IdleTimeout time.Duration `yaml:"idleTimeout,omitempty"`
+}
+
+const (
+	defaultMaxBodyBytes = 10 << 20
+	// A request has this long to send its headers, and this long to arrive in full
+	serverReadHeaderTimeout = 10 * time.Second
+	serverReadTimeout       = 30 * time.Second
+	// Alertmanager's own client closes its idle connections after 5 minutes, so with this it is always the caller
+	// that closes first
+	defaultIdleTimeout = 10 * time.Minute
+	// How much of a request body trace logging prints
+	traceBodyLimit = 64 << 10
+)
+
+// maxBodyBytes is the largest webhook body the handler reads
+func (w *WebhookServer) maxBodyBytes() int64 {
+	if w != nil && w.Listen != nil && w.Listen.MaxBodyBytes > 0 {
+		return w.Listen.MaxBodyBytes
+	}
+	return defaultMaxBodyBytes
+}
+
+// httpServer returns the listener's server, with its limits on how long a caller may take
+func (w *WebhookServer) httpServer() *http.Server {
+	srv := &http.Server{
+		ReadHeaderTimeout: serverReadHeaderTimeout,
+		ReadTimeout:       serverReadTimeout,
+		// Always set: left at zero, net/http would reuse the 30s read timeout as the idle timeout
+		IdleTimeout: defaultIdleTimeout,
+		// No WriteTimeout: the answer is written only after every router has been sent to, 30s each at worst
+	}
+	if w.Listen != nil {
+		srv.Addr = fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
+		if w.Listen.IdleTimeout != 0 {
+			srv.IdleTimeout = w.Listen.IdleTimeout
+		}
+	}
+	return srv
 }
 
 type WebhookServerMetrics struct {
@@ -460,97 +601,83 @@ var routersRejected int
 var routerMutex sync.Mutex
 var rejectedRouters prometheus.Gauge
 
+// SIGHUP, the trigger file and the directory watcher can all ask for a reload at once; they take turns
+var reloadMutex sync.Mutex
+
+// ReloadRouters builds a new set of routers from the config file's routers and the additional router directory, and
+// swaps it in.  Requests that are being served keep the set they started with.
 func (w *WebhookServer) ReloadRouters() error {
-	// Read the specified set of routers, check for consistency, apply default HTTP method if relevant, and add to the array
-	var tmpAllRouters []*WebhookRouter
-	tmpRoutersRejected := 0
-	for _, rt := range w.Routers {
-		if rt.Check() != nil {
-			tmpRoutersRejected++
-			continue
+	reloadMutex.Lock()
+	defer reloadMutex.Unlock()
+
+	var loaded []*WebhookRouter
+	rejected := 0
+	accept := func(rt *WebhookRouter, source string) {
+		if rt == nil {
+			rejected++
+			warnf("Rejecting router from %s: it is empty", source)
+			return
 		}
-		if err := rt.prepare(); err != nil {
-			tmpRoutersRejected++
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("Rejecting router [URL=\"%s\"]: %v", rt.DestURL, err)
-			}
-			continue
-		}
-		tmpAllRouters = append(tmpAllRouters, rt)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
-		}
-	}
-	if w.AdditionalRouterDirectory != "" {
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Inspecting AdditionalRouterDirectory [%s] for more routers", w.AdditionalRouterDirectory)
-		}
-		// Read every file in this directory and attempt to unmarshal it into a WebhookRouter object; if it fails, ignore and just keep going
-		files, err := os.ReadDir(w.AdditionalRouterDirectory)
+		err := rt.Check()
 		if err == nil {
-			for _, file := range files {
-				if !file.IsDir() {
-					filename := file.Name()
-					contents, err := os.ReadFile(w.AdditionalRouterDirectory + "/" + filename)
-					if err == nil {
-						b := bytes.NewBuffer(contents)
-						dec := yaml.NewDecoder(b)
-						rt := new(WebhookRouter)
-						err = dec.Decode(rt)
-						if err == nil {
-							// Lint the object to make sure it has the minimum fields
-							if rt.Check() == nil {
-								// Check doesn't verify HTTP Method since prepare assumes POST as a default.
-								if err := rt.prepare(); err != nil {
-									tmpRoutersRejected++
-									if DEBUGLEVEL_DEBUG {
-										log.Printf("Rejecting router [URL=\"%s\"] from [%s]: %v", rt.DestURL, file.Name(), err)
-									}
-								} else {
-									tmpAllRouters = append(tmpAllRouters, rt)
-									if DEBUGLEVEL_DEBUG {
-										log.Printf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
-									}
+			err = rt.prepare()
+		}
+		if err != nil {
+			rejected++
+			warnf("Rejecting router [URL=\"%s\"] from %s: %v", rt.DestURL, source, err)
+			return
+		}
+		loaded = append(loaded, rt)
+		debugf("Including router: [URL=\"%s\"|Method=%s|ContentType=\"%s\"|%d matchers]", rt.DestURL, rt.HttpMethod, rt.ContentType, len(rt.Matchers))
+	}
 
-								}
-							} else {
-								tmpRoutersRejected++
-								if DEBUGLEVEL_DEBUG {
-									log.Printf("Read WebhookRouter object but it failed its Check(): [%s]", file.Name())
-								}
-							}
-						} else {
-							if DEBUGLEVEL_DEBUG {
-								log.Printf("Read file but could not unmarshal as WebhookRouter object: [%s]", file.Name())
-							}
-						}
-					} else {
-						if DEBUGLEVEL_TRACE {
-							log.Printf("Error reading file [%s]: %v", file.Name(), err)
-						}
-					}
-				} else {
-					if DEBUGLEVEL_TRACE {
-						log.Printf("Directory entry is a directory: %s", file.Name())
-					}
-				}
+	// The configured routers are only ever copied, so a reload cannot disturb the ones that are handling requests
+	for i, rt := range w.Routers {
+		accept(rt.clone(), fmt.Sprintf("the config file (router %d)", i+1))
+	}
+
+	if w.AdditionalRouterDirectory != "" {
+		debugf("Inspecting AdditionalRouterDirectory [%s] for more routers", w.AdditionalRouterDirectory)
+		files, err := os.ReadDir(w.AdditionalRouterDirectory)
+		if err != nil {
+			warnf("Error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
+		}
+		for _, file := range files {
+			path := filepath.Join(w.AdditionalRouterDirectory, file.Name())
+			// Stat follows symlinks: a ConfigMap or Secret volume holds a "..data" link to a directory next to its files
+			if info, err := os.Stat(path); err != nil || info.IsDir() {
+				tracef("Directory entry is not a file: %s", file.Name())
+				continue
 			}
-		} else {
-			if DEBUGLEVEL_DEBUG {
-				log.Printf("WebhookServer.Start had an error reading router configs from directory [%s]: %v", w.AdditionalRouterDirectory, err)
+			contents, err := os.ReadFile(path)
+			if err != nil {
+				rejected++
+				warnf("Rejecting router file [%s]: %v", file.Name(), err)
+				continue
 			}
+			rt := new(WebhookRouter)
+			dec := yaml.NewDecoder(bytes.NewReader(contents))
+			// A misspelled key must not quietly leave a router without its credentials or TLS settings
+			dec.SetStrict(true)
+			if err := dec.Decode(rt); err != nil {
+				rejected++
+				warnf("Rejecting router file [%s]: not a router document: %v", file.Name(), err)
+				continue
+			}
+			accept(rt, "file "+file.Name())
 		}
 	}
 
-	if len(tmpAllRouters) < 1 {
+	if len(loaded) < 1 {
 		return errors.New("WebhookServer.ReloadRouters error - No valid routers present")
 	}
 
 	routerMutex.Lock()
-	routersRejected = tmpRoutersRejected
-	w.allRouters = tmpAllRouters
+	routersRejected = rejected
+	w.allRouters = loaded
 	routerMutex.Unlock()
 
+	infof("Loaded %d routers; rejected %d", len(loaded), rejected)
 	return nil
 }
 
@@ -594,18 +721,14 @@ func (w *WebhookServer) Start() error {
 		Help: "This is the number of webhook router configs defined in the running spitter instance",
 	})
 	c.Set(float64(len(w.allRouters)))
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_routers", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_routers", ApplicationName)
 
 	rejectedRouters = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: ApplicationName + "_webhook_routers_rejected",
 		Help: "This is the number of webhook router configs viewed - either in app config or found as valid routers in the additional router config directory - and determined unworkable",
 	})
 	rejectedRouters.Set(float64(routersRejected))
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_routers_rejected", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_routers_rejected", ApplicationName)
 
 	// connectionMutex, connectionGauge defined further below near the main API handler function
 	connectionGauge = promauto.NewGauge(prometheus.GaugeOpts{
@@ -613,27 +736,21 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of active connections to the webhook router (active connections from an Alertmanager)",
 	})
 	connectionGauge.Set(0)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_connections", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_connections", ApplicationName)
 
 	connectionCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests",
 		Help: "Total number of webhook requests seen",
 	})
 	prometheus.MustRegister(connectionCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests", ApplicationName)
 
 	healthzCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_healthz_count",
 		Help: "Total number of /healthz health check requests",
 	})
 	prometheus.MustRegister(healthzCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_healthz_count", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_healthz_count", ApplicationName)
 
 	// webhookreq* mutex and prometheus metric variables defined further below near main API handler function
 	webhookreqAttemptedCounter = prometheus.NewCounter(prometheus.CounterOpts{
@@ -641,27 +758,21 @@ func (w *WebhookServer) Start() error {
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and attempted",
 	})
 	prometheus.MustRegister(webhookreqAttemptedCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests_attempted", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests_attempted", ApplicationName)
 
 	webhookreqSuccessfulCounter = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: ApplicationName + "_webhook_requests_successful",
 		Help: "Number of webhook requests received by Alertmanager where a router was matched and successfully routed (destination answered with a 2xx status)",
 	})
 	prometheus.MustRegister(webhookreqSuccessfulCounter)
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Registered Prometheus metric: %s_webhook_requests_successful", ApplicationName)
-	}
+	tracef("Registered Prometheus metric: %s_webhook_requests_successful", ApplicationName)
 
 	// Set up SIGHUP handler for reloading routers
 	hupChan := make(chan os.Signal, 4)
 	go func(hupchan chan os.Signal, w *WebhookServer) {
 		for {
 			<-hupchan
-			if DEBUGLEVEL_TRACE {
-				log.Println("SIGHUP received")
-			}
+			infof("SIGHUP received")
 			err := w.ReloadRouters()
 			if err != nil {
 				// True to the same behavior as .Start(), if there are no routers defined, we bomb.
@@ -674,9 +785,7 @@ func (w *WebhookServer) Start() error {
 		}
 	}(hupChan, w)
 	signal.Notify(hupChan, syscall.SIGHUP)
-	if DEBUGLEVEL_DEBUG {
-		log.Println("Listening for SIGHUP to reload the router list")
-	}
+	infof("Listening for SIGHUP to reload the router list")
 
 	// Set up ReloadTriggerFile watcher for reloading routers
 	if w.ReloadTriggerFile != "" {
@@ -704,9 +813,7 @@ func (w *WebhookServer) Start() error {
 				time.Sleep(5 * time.Second)
 			}
 		}(w.ReloadTriggerFile, w)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Watching every 5 seconds for trigger file [%s] to reload the router list", w.ReloadTriggerFile)
-		}
+		infof("Watching every 5 seconds for trigger file [%s] to reload the router list", w.ReloadTriggerFile)
 	}
 
 	// Set up AdditionalRouterDirectory watcher for reloading routers when the directory contents change.
@@ -720,9 +827,7 @@ func (w *WebhookServer) Start() error {
 					continue
 				}
 				lastSum = sum
-				if DEBUGLEVEL_DEBUG {
-					log.Printf("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
-				}
+				infof("Contents of AdditionalRouterDirectory [%s] changed; reloading routers", w.AdditionalRouterDirectory)
 				err := w.ReloadRouters()
 				if err != nil {
 					// True to the same behavior as .Start(), if there are no routers defined, we bomb.
@@ -733,9 +838,7 @@ func (w *WebhookServer) Start() error {
 				routerMutex.Unlock()
 			}
 		}(addlRouterDirSum, w)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
-		}
+		infof("Watching every %s for changes in AdditionalRouterDirectory [%s] to reload the router list", w.AdditionalRouterWatch, w.AdditionalRouterDirectory)
 	}
 
 	// Set up Prometheus metrics config
@@ -763,14 +866,10 @@ func (w *WebhookServer) Start() error {
 	// TODO: http.HandleFunc("/v4/alertmanager/routers", handleListRoutersV4) as a GET request to list all our configured routers
 
 	GlobalWebhookServer = w // so the handler functions can find us
-	listenStr := fmt.Sprintf("%s:%d", w.Listen.Hostname, w.Listen.Port)
-	if DEBUGLEVEL_INFO {
-		log.Printf("WebhookServer listening on: %s\n", listenStr)
-	}
-	if DEBUGLEVEL_DEBUG {
-		log.Printf("All URIs: %#v\n", allURIs)
-	}
-	log.Fatal(http.ListenAndServe(listenStr, nil))
+	srv := w.httpServer()   // serves the default mux, where the handlers above are registered
+	infof("WebhookServer listening on: %s\n", srv.Addr)
+	debugf("All URIs: %#v\n", allURIs)
+	log.Fatal(srv.ListenAndServe())
 	return nil
 }
 
@@ -812,8 +911,8 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	healthzCounter.Inc()
 	healthzMutex.Unlock()
 
-	if DEBUGLEVEL_TRACE && ENABLE_HEALTHZ_DEBUG {
-		log.Printf("Received healthz request [%#v]", r)
+	if ENABLE_HEALTHZ_DEBUG {
+		tracef("Received healthz request [%#v]", r)
 	}
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("Up\n"))
@@ -854,81 +953,97 @@ func handleWebhooksV4(w http.ResponseWriter, r *http.Request) {
 	// POST only allowed
 	if r.Method != http.MethodPost {
 		w.WriteHeader(http.StatusMethodNotAllowed)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Received HTTP request with invalid method [%s] - expecting POST", r.Method)
-		}
+		debugf("Received HTTP request with invalid method [%s] - expecting POST", r.Method)
 		fmt.Fprintf(w, "Invalid request method [%s] - we only expect the use of POST with this endpoint\r\n", r.Method)
 		return
 	}
 
-	// Collect payload
-	body, err := io.ReadAll(r.Body)
+	// Collect payload, up to a limit: the whole body is held in memory, and decoding it takes a few times as much again
+	limit := GlobalWebhookServer.maxBodyBytes()
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Error reading request body [%v]", err)
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			// Alertmanager does not retry a 4xx, so say what to do about it
+			warnf("Refusing a webhook: its body is larger than %d bytes (listen.maxBodyBytes).  Alertmanager will not retry it; raise the limit or set max_alerts on the receiver.", limit)
+			fmt.Fprintf(w, "Webhook body is larger than %d bytes\r\n", limit)
+			return
 		}
+		w.WriteHeader(http.StatusBadRequest)
+		warnf("Error reading request body [%v]", err)
 		fmt.Fprintf(w, "Error reading request body [%v]\r\n", err)
 		return
 	}
-	defer r.Body.Close()
 
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, body)
+	if logEnabled(logLevelTrace) {
+		tracef("Received a POST payload:\nHeaders: %#v\nPostdata:\n%s\n", r.Header, logExcerpt(body, traceBodyLimit))
 	}
 
-	// Unmarshal what we expect to be an Alertmanager webhook request
-	b := bytes.NewBuffer(body)
-	dec := yaml.NewDecoder(b)
+	// Alertmanager sends JSON.  Decoding it as anything looser would refuse or alter text that JSON carries untouched.
 	alertwebhook := new(alerts.AlertmanagerWebhookInputV4)
-	err = dec.Decode(alertwebhook)
-	if err != nil {
+	if err := json.Unmarshal(body, alertwebhook); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		fmt.Fprintf(w, "Error processing webhook from POST data [%v]\r\n", err)
-		if DEBUGLEVEL_DEBUG {
-			log.Printf("Received POST data but could not unmarshal into an AlertmanagerWebhookInputV4: %v", err)
-		}
+		warnf("Refusing a webhook: POST data is not an Alertmanager webhook in JSON: %v", err)
 		return
 	}
+	// Nothing can be routed from a payload we do not understand, so do not tell Alertmanager it was delivered
+	if alertwebhook.Version != alerts.WebhookVersion {
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintf(w, "Unsupported webhook version [%s] - this endpoint expects version %s\r\n", alertwebhook.Version, alerts.WebhookVersion)
+		warnf("Refusing a webhook: version is [%s], expected [%s]", alertwebhook.Version, alerts.WebhookVersion)
+		return
+	}
+	// A null in the alert list carries nothing to route
+	alertwebhook.Alerts = slices.DeleteFunc(alertwebhook.Alerts, func(al *alerts.AlertmanagerAlertV4) bool { return al == nil })
 
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Received the following alert webhook:\n%s\n", alertwebhook.String())
+	if logEnabled(logLevelTrace) {
+		tracef("Received the following alert webhook:\n%s\n", alertwebhook.String())
 	}
 
-	// Find routers that might want to receive this
-	if DEBUGLEVEL_TRACE {
-		log.Printf("Processing through %d routers-", len(GlobalWebhookServer.GetRouters()))
-	}
-	for _, r := range GlobalWebhookServer.GetRouters() {
-		hasMatching := 0
-		for _, m := range r.Matchers {
-			if DEBUGLEVEL_TRACE {
-				log.Printf("evaluating matcher: %s\n", m.String())
-			}
-			if m.HasMatchingAlerts(alertwebhook) {
-				hasMatching++
-			}
-		}
-		if DEBUGLEVEL_TRACE {
-			log.Printf("evaluating webhook against router: found %d matchers that matched vs %d matchers\n", hasMatching, len(r.Matchers))
-		}
-		if hasMatching == len(r.Matchers) {
-			// This router completely triggers on this alert; process it
-			webhookreqAttemptedMutex.Lock()
-			webhookreqAttemptedCounter.Inc()
-			webhookreqAttemptedMutex.Unlock()
-
-			templated, err := r.PrepareTemplateData(alertwebhook)
-			if err == nil {
-				r.SendWebhook(templated)
-			} else {
-				if DEBUGLEVEL_DEBUG {
-					log.Printf("Attempted to route a webhook but failed: %v", err)
-				}
-			}
-		}
+	routers := GlobalWebhookServer.GetRouters()
+	tracef("Processing through %d routers-", len(routers))
+	for _, router := range routers {
+		routeWebhook(router, alertwebhook)
 	}
 
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte("\r\n"))
+}
+
+// routeWebhook sends the webhook through one router, if the router wants any of it
+func routeWebhook(r *WebhookRouter, a *alerts.AlertmanagerWebhookInputV4) {
+	// Whatever goes wrong with one router, the routers after it still get the alert
+	defer func() {
+		if p := recover(); p != nil {
+			warnf("Router [URL=\"%s\"] panicked while handling a webhook: %v\n%s", r.DestURL, p, debug.Stack())
+		}
+	}()
+
+	// Cheap first pass: every matcher must find something somewhere in the group
+	for _, m := range r.Matchers {
+		if !m.HasMatchingAlerts(a) {
+			tracef("router [URL=\"%s\"] skipped: nothing matches %s", r.DestURL, m)
+			return
+		}
+	}
+
+	templated, err := r.PrepareTemplateData(a)
+	if err != nil {
+		warnf("Attempted to route a webhook to [URL=\"%s\"] but failed: %v", r.DestURL, err)
+		return
+	}
+	// The matchers were satisfied by different alerts and no single alert satisfies them all
+	if len(templated.Alerts) == 0 && len(a.Alerts) > 0 {
+		tracef("router [URL=\"%s\"] skipped: no alert satisfies every matcher", r.DestURL)
+		return
+	}
+
+	webhookreqAttemptedMutex.Lock()
+	webhookreqAttemptedCounter.Inc()
+	webhookreqAttemptedMutex.Unlock()
+
+	// SendWebhook reports its own failures
+	r.SendWebhook(templated)
 }

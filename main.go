@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"fmt"
 	"log"
 	"os"
 	"time"
@@ -14,11 +15,7 @@ import (
 
 const ApplicationName = `spitter`
 
-// TODO: Implement a better debug log system
-const DEBUGLEVEL_TRACE = true
-const DEBUGLEVEL_DEBUG = true
-const DEBUGLEVEL_INFO = true
-const DEBUGLEVEL_WARNING = true
+// Health checks arrive every few seconds; logging them drowns everything else, even at trace
 const ENABLE_HEALTHZ_DEBUG = false
 
 var CLI struct {
@@ -29,11 +26,28 @@ var CLI struct {
 		RouterDir     string        `optional:"" name:"routers" env:"SPITTER_ROUTERS_DIR" help:"Directory full of webhook router YAML or JSON configuration documents"`
 		RouterWatch   time.Duration `optional:"" name:"routers-watch-interval" env:"SPITTER_ROUTERS_WATCH_INTERVAL" help:"Poll the --routers directory at this interval (e.g. 10s) and reload routers when its contents change.  0 disables."`
 		ReloadTrigger string        `optional:"" name:"reload-trigger" env:"SPITTER_RELOAD_TRIGGER" help:"File to watch indicating a reload of router config is necessary; file is deleted after reload.  SIGHUP also performs this."`
+		LogLevel      string        `optional:"" name:"log-level" env:"SPITTER_LOG_LEVEL" help:"trace, debug, info or warning.  trace (the default) logs request headers, payloads and rendered templates, which can hold secrets."`
 	} `cmd:"" help:"Run a webhook router server receiving Alertmanager V4 webhooks"`
 	Dump struct {
 		Listen string `optional:"" name:"listen" help:"Hostname or IP address of interface to listen"`
 		Port   int    `optional:"" name:"port" help:"TCP port for listening"`
 	} `cmd:"" help:"Run a simple webserver that dumps its requests to stdout"`
+}
+
+// loadConfigFile reads the WebhookServer config.  Keys it does not know are an error: a misspelled one would
+// otherwise be dropped without a word.
+func loadConfigFile(path string) (*WebhookServer, error) {
+	cf, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("Error reading Router config file: %v", err)
+	}
+	configObj := new(WebhookServer)
+	dec := yaml.NewDecoder(bytes.NewReader(cf))
+	dec.SetStrict(true)
+	if err := dec.Decode(configObj); err != nil {
+		return nil, fmt.Errorf("Error unmarshalling Router config from file [%s]: %v", path, err)
+	}
+	return configObj, nil
 }
 
 func main() {
@@ -58,16 +72,10 @@ func main() {
 			r.Matchers = append(r.Matchers, m)
 			configObj.Routers = append(configObj.Routers, r)
 		} else {
-			// Read the config file
-			cf, err := os.ReadFile(CLI.Router.Config)
+			var err error
+			configObj, err = loadConfigFile(CLI.Router.Config)
 			if err != nil {
-				log.Fatalf("Error reading Router config file: %v\n", err)
-			}
-			b := bytes.NewBuffer(cf)
-			dec := yaml.NewDecoder(b)
-			err = dec.Decode(configObj)
-			if err != nil {
-				log.Fatalf("Error unmarshalling Router config from file [%s]: %v\n", CLI.Router.Config, err)
+				log.Fatalf("%v\n", err)
 			}
 		}
 		// CLI config option overrides
@@ -85,6 +93,14 @@ func main() {
 		}
 		if CLI.Router.ReloadTrigger != "" {
 			configObj.ReloadTriggerFile = CLI.Router.ReloadTrigger
+		}
+		if CLI.Router.LogLevel != "" {
+			configObj.LogLevel = CLI.Router.LogLevel
+		}
+		if configObj.LogLevel != "" {
+			if err := setLogLevel(configObj.LogLevel); err != nil {
+				log.Fatalf("%v\n", err)
+			}
 		}
 
 		// Run the webhook routing server

@@ -4,10 +4,10 @@ description: Spitter - templating webhook router for Prometheus Alertmanager
 type: application
 
 # Chart version; bump on every chart change (SemVer).
-version: 0.2.1
+version: 0.3.0
 
 # Default image tag deployed by this chart.
-appVersion: "0.2.0"
+appVersion: "0.3.0"
 
 kubeVersion: ">=1.25.0-0"
 home: https://github.com/spirilis/spitter

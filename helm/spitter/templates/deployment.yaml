@@ -91,9 +91,16 @@ spec:
           lifecycle:
             {{- toYaml . | nindent 12 }}
           {{- end }}
-          {{- with .Values.env }}
+          {{- if or $s.logLevel .Values.env }}
           env:
+            {{- with $s.logLevel }}
+            # An environment variable rather than a flag, so that an image from before the flag existed still starts
+            - name: SPITTER_LOG_LEVEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.env }}
             {{- toYaml . | nindent 12 }}
+            {{- end }}
           {{- end }}
           {{- with .Values.envFrom }}
           envFrom:

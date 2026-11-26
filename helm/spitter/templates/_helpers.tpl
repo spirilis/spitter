@@ -102,12 +102,37 @@ Non-empty when an additional routers ConfigMap/Secret is mounted.
 {{- end }}
 
 {{/*
+Non-empty when spitter can be reached from outside the cluster's pod network, where the callers are not pods that a
+NetworkPolicy could select by label.
+*/}}
+{{- define "spitter.exposedExternally" -}}
+{{- if or .Values.ingress.enabled .Values.httpRoute.enabled (eq .Values.service.type "NodePort") (eq .Values.service.type "LoadBalancer") }}true{{ end }}
+{{- end }}
+
+{{/*
+Non-empty when the NetworkPolicy is rendered: it is enabled, and either every caller is a pod inside the cluster or
+networkPolicy.extraFrom says who delivers the outside traffic.
+*/}}
+{{- define "spitter.networkPolicy" -}}
+{{- with .Values.networkPolicy }}
+{{- if and .enabled (or (not (include "spitter.exposedExternally" $)) .extraFrom) }}true{{ end }}
+{{- end }}
+{{- end }}
+
+{{/*
 Generated spitter config file.  Leaving listen.host empty binds all interfaces, including IPv6.
 */}}
 {{- define "spitter.configFile" -}}
 {{- $s := .Values.spitter }}
+{{- $listen := dict "port" ($s.port | int) }}
+{{- with $s.maxBodyBytes }}
+{{- $_ := set $listen "maxBodyBytes" (. | int64) }}
+{{- end }}
+{{- with $s.idleTimeout }}
+{{- $_ := set $listen "idleTimeout" (. | toString) }}
+{{- end }}
 {{- $cfg := dict
-  "listen" (dict "port" ($s.port | int))
+  "listen" $listen
   "alertmanagerURL" (required "spitter.alertmanagerURL is required unless spitter.existingConfig is set" $s.alertmanagerURL)
   "prometheusURL" (required "spitter.prometheusURL is required unless spitter.existingConfig is set" $s.prometheusURL)
   "metrics" (dict "path" $s.metricsPath)
@@ -131,6 +156,9 @@ Reject contradictory settings early instead of producing a crash-looping pod.
 {{- end }}
 {{- if and (include "spitter.generateConfig" .) (not $s.routers) (not (include "spitter.hasAdditionalRouters" .)) }}
 {{- fail "spitter needs at least one router: set spitter.routers, spitter.additionalRouters or spitter.existingConfig" }}
+{{- end }}
+{{- if and (include "spitter.networkPolicy" .) (not (concat .Values.networkPolicy.from .Values.networkPolicy.extraFrom)) }}
+{{- fail "networkPolicy.from and networkPolicy.extraFrom are both empty, which would admit every caller; set networkPolicy.enabled=false instead" }}
 {{- end }}
 {{- if and .Values.httpRoute.enabled (not .Values.httpRoute.parentRefs) }}
 {{- fail "httpRoute.parentRefs must list at least one Gateway when httpRoute.enabled is true" }}

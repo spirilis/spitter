@@ -24,7 +24,7 @@ spitter:
     - url: https://chat.example.com/hooks/alerts
       contentType: application/json
       template: |-
-        {"text": "[{{ .Status }}] {{ range .Alerts }}{{ .Labels.alertname }} {{ end }}"}
+        {"text": {{ printf "[%s] %d alert(s): %s" .Status (len .Alerts) .CommonLabels.alertname | toJson }}}
       matchers:
         - label: severity
           match_re: "critical|warning"
@@ -89,6 +89,58 @@ Rules are passed through as written (matches, filters, timeouts, ...), with `bac
 spitter Service.  When the Gateway lives in another namespace, its listener's `allowedRoutes` must admit this
 release's namespace.
 
+## Network policy
+
+spitter's webhook endpoint has no authentication: anyone who can reach it can have alerts sent to your routers'
+destinations.  Set `networkPolicy.enabled: true` to have the chart create a NetworkPolicy that only lets
+Alertmanager (to post webhooks) and Prometheus (to scrape metrics) connect to the spitter pods.  It is off by
+default.  These are its defaults once enabled:
+
+```yaml
+networkPolicy:
+  enabled: true
+  from:
+    - namespaceSelector: {}        # any namespace
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: alertmanager
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+```
+
+Those are the labels prometheus-operator (kube-prometheus-stack) puts on its pods.  **If your Alertmanager's pods
+are labelled differently, the policy blocks its webhooks**: check with
+`kubectl get pods -A -l app.kubernetes.io/name=alertmanager` before enabling it, and replace `networkPolicy.from`
+to match yours.  The default admits a pod with that label in any namespace; put your monitoring namespace in
+`namespaceSelector` (`matchLabels: {kubernetes.io/metadata.name: monitoring}`) to narrow it.
+
+An enabled policy can only be created when the callers can be named.  Once spitter is exposed outside the cluster
+(Ingress, HTTPRoute, NodePort or LoadBalancer), the traffic arrives from your ingress controller, gateway or an
+outside address, which the chart cannot know.  It then creates no policy, and says so in the release notes, unless
+`networkPolicy.extraFrom` names those callers:
+
+```yaml
+networkPolicy:
+  extraFrom:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: ingress-nginx
+    # - ipBlock:
+    #     cidr: 203.0.113.10/32    # an Alertmanager outside the cluster
+```
+
+The policy covers ingress only, so spitter's connections to its destinations are unaffected, and it needs a CNI
+that enforces NetworkPolicy.  `networkPolicy.extraIngress` adds whole rules, e.g. for the ports of `extraContainers`.
+
+## Logging
+
+`spitter.logLevel` (default `info`) is passed as `SPITTER_LOG_LEVEL`.  `info` reports startup, reloads and everything
+that loses an alert: rejected routers, failed sends and refused payloads.  `trace` adds request headers, alert
+payloads, rendered templates and destination responses, which is useful while writing templates but can put secrets
+in the log.  Destination URLs appear in warnings at every level.
+
 ## Router configuration
 
 There are three ways to provide routers, and they can be combined:
@@ -113,6 +165,9 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `image.digest` | `""` | Pin by digest; wins over `tag`. |
 | `spitter.port` | `9820` | Container listen port. |
 | `spitter.alertmanagerURL` / `spitter.prometheusURL` | `""` | External base URLs used to rewrite alert links.  Required unless `existingConfig` is set. |
+| `spitter.logLevel` | `info` | `trace`, `debug`, `info` or `warning`; `""` leaves it to the config file or spitter's default (`trace`). |
+| `spitter.maxBodyBytes` | `0` (spitter's 10 MiB) | Largest webhook body accepted; larger ones get a 413. |
+| `spitter.idleTimeout` | `""` (spitter's `10m`) | How long an idle keep-alive connection is kept; keep it above your ingress proxy's. |
 | `spitter.metricsPath` | `/metrics` | Metrics path (also used by the PodMonitor). |
 | `spitter.routers` | `[]` | Inline routers. |
 | `spitter.configInSecret` | `false` | Store the generated config in a Secret. |
@@ -128,6 +183,9 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `service.extraPorts` | `[]` | Additional ServicePorts, e.g. for sidecars. |
 | `ingress.*` | disabled | `networking.k8s.io/v1` Ingress. |
 | `httpRoute.*` | disabled | Gateway API HTTPRoute. |
+| `networkPolicy.enabled` | `false` | NetworkPolicy admitting only the peers below; skipped when spitter is exposed externally and `extraFrom` is empty. |
+| `networkPolicy.from` | Alertmanager and Prometheus pods in any namespace | Peers allowed to reach spitter's port. |
+| `networkPolicy.extraFrom` / `networkPolicy.extraIngress` | `[]` | More peers for spitter's port / more ingress rules. |
 | `metrics.podMonitor.*` | disabled | prometheus-operator PodMonitor (`labels`, `interval`, `relabelings`, ...). |
 | `autoscaling.*` | disabled | HorizontalPodAutoscaler (`autoscaling/v2`). |
 | `podDisruptionBudget.*` | disabled | PodDisruptionBudget. |
@@ -137,6 +195,25 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 | `extraVolumes` / `extraVolumeMounts` / `initContainers` / `extraContainers` | `[]` | Pass-through pod spec additions. |
 
 See [`values.yaml`](values.yaml) for everything else (probes, lifecycle hooks, resources, scheduling).
+
+## Upgrading from 0.2.x
+
+Chart 0.3.0 ships spitter 0.3.0, which is stricter about what it accepts.  Check these before upgrading:
+
+- **Webhooks must be JSON**, as Alertmanager sends them.  A hand-written YAML body is answered with `400`.
+- **Unknown keys are errors.**  A config file with a key spitter does not know stops it at startup, and a router
+  document with one is rejected.  Look for misspellings such as `auht:` that used to be ignored.
+- **More routers are rejected at load** instead of failing later: a template that does not parse, a `url` that is
+  not `http(s)://` with a host, a matcher without `label` or without `match`/`match_re`, and `auth` with more than
+  one of `token`, `tokenFile` and `basicAuth`.  `spitter_webhook_routers_rejected` and the log show which.
+- **A webhook larger than 10 MiB is answered with `413`.**  Raise `spitter.maxBodyBytes`, or set `max_alerts` on
+  the Alertmanager receiver.
+- **A router whose matchers are only satisfied by different alerts no longer fires**, and `.Status` describes the
+  alerts a router actually receives.
+- **The log level defaults to `info`** (`spitter.logLevel`).  Set it to `trace` to see payloads and rendered
+  templates again.
+
+New and off by default: `networkPolicy`.
 
 ## Upgrading from 0.1.x
 
