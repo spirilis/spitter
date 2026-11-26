@@ -17,6 +17,7 @@ go build -o spitter .              # /spitter is gitignored
 go test -race ./...                # the reload test only proves anything under the race detector
 helm lint helm/spitter -f helm/spitter/ci/<x>-values.yaml   # clusterip, gateway, nodeport-ingress
 docker buildx build --platform linux/amd64,linux/arm64 -t spirilis/spitter:<ver> .
+REGISTRY=<host> ./deploy-assets-oci.sh   # builds and PUSHES image + chart; the owner runs this, not Claude
 ```
 
 The binary has two kong subcommands (`main.go`):
@@ -197,7 +198,14 @@ These came up in the 2026-11 review and the owner ruled on them. Don't raise the
 - `values.schema.json` validates values; update it alongside `values.yaml`.
 - `ci/*-values.yaml` are lint/test value sets.
 - When the app or chart changes, bump `Chart.yaml` `version` (and `appVersion` for app changes). Currently
-  version `0.2.3` / appVersion `0.2.2`.
+  version `0.3.0` / appVersion `0.3.0`.
+
+## Releasing
+
+`deploy-assets-oci.sh` builds the multi-platform image, tags it with the chart's `appVersion` (and `latest`), and
+pushes it and the packaged chart to `$REGISTRY` (required; no default). `IMAGE_REPO` defaults to `library/spitter`
+and `CHART_REPO` to `helm/spitter`. The chart's default image is still `docker.io/spirilis/spitter`, so an install
+from another registry sets `image.registry` and `image.repository`; the script prints the command.
 
 ## Container
 

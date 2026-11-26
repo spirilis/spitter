@@ -196,6 +196,25 @@ certificates are verified by default; see the [spitter README](../../README.md#r
 
 See [`values.yaml`](values.yaml) for everything else (probes, lifecycle hooks, resources, scheduling).
 
+## Upgrading from 0.2.x
+
+Chart 0.3.0 ships spitter 0.3.0, which is stricter about what it accepts.  Check these before upgrading:
+
+- **Webhooks must be JSON**, as Alertmanager sends them.  A hand-written YAML body is answered with `400`.
+- **Unknown keys are errors.**  A config file with a key spitter does not know stops it at startup, and a router
+  document with one is rejected.  Look for misspellings such as `auht:` that used to be ignored.
+- **More routers are rejected at load** instead of failing later: a template that does not parse, a `url` that is
+  not `http(s)://` with a host, a matcher without `label` or without `match`/`match_re`, and `auth` with more than
+  one of `token`, `tokenFile` and `basicAuth`.  `spitter_webhook_routers_rejected` and the log show which.
+- **A webhook larger than 10 MiB is answered with `413`.**  Raise `spitter.maxBodyBytes`, or set `max_alerts` on
+  the Alertmanager receiver.
+- **A router whose matchers are only satisfied by different alerts no longer fires**, and `.Status` describes the
+  alerts a router actually receives.
+- **The log level defaults to `info`** (`spitter.logLevel`).  Set it to `trace` to see payloads and rendered
+  templates again.
+
+New and off by default: `networkPolicy`.
+
 ## Upgrading from 0.1.x
 
 0.2.0 is a rewrite and the values layout changed:

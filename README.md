@@ -126,6 +126,14 @@ docker build -t spirilis/spitter:dev .
 docker buildx build --platform linux/amd64,linux/arm64 -t spirilis/spitter:0.2.0 --push .
 ```
 
+[`deploy-assets-oci.sh`](deploy-assets-oci.sh) builds that multi-arch image and pushes it, together with the Helm
+chart, to an OCI registry of your choice.  The image is tagged with the chart's `appVersion`:
+
+```sh
+REGISTRY=oci.example.com ./deploy-assets-oci.sh   # image: library/spitter, chart: helm/spitter
+REGISTRY=oci.example.com IMAGE_REPO=team/spitter CHART_REPO=charts/spitter ./deploy-assets-oci.sh
+```
+
 The image runs `spitter router` by default.  Mount a config file, or configure it with flags or environment
 variables:
 
